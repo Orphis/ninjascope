@@ -1,0 +1,7 @@
+# generated demo project and reports
+sample/
+report.html
+*.html
+!template.html
+
+__pycache__/

@@ -1,0 +1,761 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NinjaViz build report</title>
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js"></script>
+<style>
+  :root {
+    color-scheme: light;
+    --page:           #f9f9f7;
+    --surface-1:      #fcfcfb;
+    --text-primary:   #0b0b0b;
+    --text-secondary: #52514e;
+    --text-muted:     #898781;
+    --grid:           #e1e0d9;
+    --baseline:       #c3c2b7;
+    --border:         rgba(11,11,11,0.10);
+    --kind-compile:   #2a78d6;
+    --kind-codegen:   #1baf7a;
+    --kind-archive:   #eda100;
+    --kind-link:      #008300;
+    --kind-other:     #4a3aa7;
+    --critical:       #d03b3b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) {
+      color-scheme: dark;
+      --page:           #0d0d0d;
+      --surface-1:      #1a1a19;
+      --text-primary:   #ffffff;
+      --text-secondary: #c3c2b7;
+      --text-muted:     #898781;
+      --grid:           #2c2c2a;
+      --baseline:       #383835;
+      --border:         rgba(255,255,255,0.10);
+      --kind-compile:   #3987e5;
+      --kind-codegen:   #199e70;
+      --kind-archive:   #c98500;
+      --kind-link:      #008300;
+      --kind-other:     #9085e9;
+      --critical:       #d03b3b;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --page:           #0d0d0d;
+    --surface-1:      #1a1a19;
+    --text-primary:   #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted:     #898781;
+    --grid:           #2c2c2a;
+    --baseline:       #383835;
+    --border:         rgba(255,255,255,0.10);
+    --kind-compile:   #3987e5;
+    --kind-codegen:   #199e70;
+    --kind-archive:   #c98500;
+    --kind-link:      #008300;
+    --kind-other:     #9085e9;
+    --critical:       #d03b3b;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--page);
+    color: var(--text-primary);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  .wrap { max-width: 1400px; margin: 0 auto; padding: 24px 28px 64px; }
+
+  header { display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap; }
+  h1 { font-size: 22px; margin: 0; font-weight: 650; }
+  .meta { color: var(--text-muted); font-size: 12.5px; }
+  #themeToggle {
+    margin-left: auto; border: 1px solid var(--border); background: var(--surface-1);
+    color: var(--text-secondary); border-radius: 8px; padding: 4px 10px; cursor: pointer;
+    font: inherit; font-size: 12.5px;
+  }
+  .banner {
+    margin-top: 12px; padding: 8px 12px; border-radius: 8px; font-size: 13px;
+    background: color-mix(in srgb, var(--critical) 12%, var(--surface-1));
+    border: 1px solid color-mix(in srgb, var(--critical) 40%, transparent);
+  }
+
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin: 18px 0 6px; }
+  .tile {
+    background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px;
+    padding: 10px 14px 12px;
+  }
+  .tile .v { font-size: 24px; font-weight: 650; letter-spacing: -0.01em; }
+  .tile .l { color: var(--text-muted); font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.05em; margin-top: 2px; }
+  .tile .s { color: var(--text-secondary); font-size: 12px; margin-top: 2px; }
+
+  section { margin-top: 34px; }
+  h2 { font-size: 15px; font-weight: 650; margin: 0 0 4px; }
+  .sub { color: var(--text-muted); font-size: 12.5px; margin: 0 0 12px; }
+
+  .toolbar { display: flex; align-items: center; gap: 18px; flex-wrap: wrap; margin: 10px 0; font-size: 12.5px; color: var(--text-secondary); }
+  .chip { display: inline-flex; align-items: center; gap: 6px; }
+  .chip .sw { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
+  .toolbar label { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; }
+  .hint { color: var(--text-muted); margin-left: auto; }
+
+  .panel { background: var(--surface-1); border: 1px solid var(--border); border-radius: 12px; padding: 12px; }
+  .timeline canvas { display: block; width: 100%; cursor: grab; }
+  .timeline canvas.dragging { cursor: grabbing; }
+  .util-label { font-size: 11px; color: var(--text-muted); margin: 8px 0 2px; }
+  .lanes-note { font-size: 11.5px; color: var(--text-muted); margin-top: 6px; display: none; }
+
+  .tooltip {
+    position: fixed; z-index: 10; pointer-events: none; display: none;
+    background: var(--surface-1); border: 1px solid var(--border); border-radius: 8px;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.25); padding: 8px 11px; font-size: 12.5px;
+    max-width: 460px;
+  }
+  .tooltip .tname { font-weight: 600; word-break: break-all; }
+  .tooltip .trow { color: var(--text-secondary); margin-top: 2px; }
+  .tooltip .cpbadge { color: var(--critical); font-weight: 600; }
+
+  .simbar { display: flex; align-items: center; gap: 18px; flex-wrap: wrap; margin: 10px 0 14px; }
+  .simbar input[type=range] { width: 320px; accent-color: var(--kind-compile); }
+  .simcores { min-width: 120px; }
+  .simcores .cl { font-size: 12px; color: var(--text-muted); }
+  .simcores .cv { font-size: 20px; font-weight: 650; }
+  .simstats { display: flex; gap: 26px; flex-wrap: wrap; }
+  .simstats div b { font-size: 17px; font-weight: 650; display: block; color: var(--text-primary); }
+  .simstats div { font-size: 11.5px; color: var(--text-muted); }
+
+  #speedupChart { height: 380px; }
+  .fallback-table table, .cp-table table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  .fallback-table th, .fallback-table td, .cp-table th, .cp-table td {
+    text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--grid);
+    font-variant-numeric: tabular-nums;
+  }
+  .fallback-table th, .cp-table th { color: var(--text-muted); font-weight: 500; font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.05em; }
+  .cp-table tbody tr { cursor: pointer; }
+  .cp-table tbody tr:hover { background: color-mix(in srgb, var(--text-primary) 5%, transparent); }
+  .cp-table .num { text-align: right; }
+  .cp-table .pct-cell { min-width: 150px; }
+  .pctbar { display: inline-block; height: 8px; border-radius: 3px; vertical-align: middle; margin-right: 8px; }
+  .cp-stats { display: flex; gap: 26px; flex-wrap: wrap; margin: 8px 0 14px; font-size: 12px; color: var(--text-muted); }
+  .cp-stats b { display: block; font-size: 17px; font-weight: 650; color: var(--text-primary); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1 id="title"></h1>
+    <div class="meta" id="meta"></div>
+    <button id="themeToggle" title="Toggle color theme">theme: auto</button>
+  </header>
+  <div class="banner" id="mixedBanner" style="display:none">
+    ⚠ The ninja log contains entries from multiple builds — the timeline shows the most
+    recent entry per output. For accurate results, run a clean full build.
+  </div>
+
+  <div class="tiles" id="tiles"></div>
+
+  <section>
+    <h2>Actual build timeline</h2>
+    <p class="sub">Each row is a lane of work observed running in parallel (from <code>.ninja_log</code> timestamps).</p>
+    <div class="toolbar" id="legend"></div>
+    <div class="panel timeline" id="actualTimeline"></div>
+  </section>
+
+  <section>
+    <h2>What-if: change the core count</h2>
+    <p class="sub">Greedy critical-path-first scheduling of the real dependency DAG using measured durations — what this build would look like with a different number of cores (e.g. remote execution).</p>
+    <div class="simbar">
+      <div class="simcores"><div class="cl">simulated cores</div><div class="cv" id="simCoresLabel"></div></div>
+      <input type="range" id="coreSlider" min="0" max="0" step="1">
+      <div class="simstats">
+        <div><b id="simWall"></b>predicted wall time</div>
+        <div><b id="simSpeedup"></b>vs. actual build</div>
+        <div><b id="simUtil"></b>core utilization</div>
+      </div>
+    </div>
+    <div class="panel timeline" id="simTimeline"></div>
+  </section>
+
+  <section>
+    <h2>Speedup curve</h2>
+    <p class="sub">Predicted wall time vs. core count. The curve can never cross the critical path — past the knee, adding cores buys nothing.</p>
+    <div class="panel"><div id="speedupChart"></div><div class="fallback-table" id="speedupFallback" style="display:none"></div></div>
+  </section>
+
+  <section>
+    <h2>Critical path</h2>
+    <p class="sub">The longest dependency chain — the hard floor on build time at any core count. Click a row to locate the task in the timeline above.</p>
+    <div class="cp-stats" id="cpStats"></div>
+    <div class="panel cp-table"><table id="cpTable"></table></div>
+  </section>
+</div>
+
+<div class="tooltip" id="tooltip"></div>
+
+<script>
+const DATA = /*__NINJAVIZ_DATA__*/null;
+
+// ---------------------------------------------------------------- helpers ---
+const $ = id => document.getElementById(id);
+const KINDS = ["compile", "codegen", "archive", "link", "other"];
+const cssVar = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+const kindColor = kind => cssVar("--kind-" + (KINDS.includes(kind) ? kind : "other"));
+
+function fmtMs(ms, precise) {
+  if (ms == null) return "–";
+  if (precise && ms < 10000) return (ms / 1000).toFixed(2) + " s";
+  if (ms < 1000) return Math.round(ms) + " ms";
+  if (ms < 90000) return (ms / 1000).toFixed(1) + " s";
+  const m = Math.floor(ms / 60000), s = Math.round((ms % 60000) / 1000);
+  return m + " m " + String(s).padStart(2, "0") + " s";
+}
+const fmtX = x => (x >= 10 ? Math.round(x) : x.toFixed(1)) + "×";
+const esc = s => s.replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+class Heap {
+  constructor(cmp) { this.a = []; this.cmp = cmp; }
+  get size() { return this.a.length; }
+  peek() { return this.a[0]; }
+  push(x) {
+    const a = this.a; a.push(x);
+    let i = a.length - 1;
+    while (i > 0) {
+      const p = (i - 1) >> 1;
+      if (this.cmp(a[i], a[p]) >= 0) break;
+      [a[i], a[p]] = [a[p], a[i]]; i = p;
+    }
+  }
+  pop() {
+    const a = this.a, top = a[0], last = a.pop();
+    if (a.length) {
+      a[0] = last;
+      let i = 0;
+      for (;;) {
+        const l = 2 * i + 1, r = l + 1; let m = i;
+        if (l < a.length && this.cmp(a[l], a[m]) < 0) m = l;
+        if (r < a.length && this.cmp(a[r], a[m]) < 0) m = r;
+        if (m === i) break;
+        [a[i], a[m]] = [a[m], a[i]]; i = m;
+      }
+    }
+    return top;
+  }
+}
+
+// ------------------------------------------------------------- data model ---
+const T = DATA.tasks;
+const N = T.length;
+T.forEach((t, i) => { t.id = i; t.kind = DATA.rules[t.rule].kind; t.ruleName = DATA.rules[t.rule].name; });
+
+const succs = T.map(() => []);
+T.forEach(t => t.deps.forEach(d => succs[d].push(t.id)));
+
+// topological order (ids are not guaranteed to be topo-sorted)
+const topo = (() => {
+  const indeg = T.map(t => t.deps.length), order = [];
+  for (let i = 0; i < N; i++) if (indeg[i] === 0) order.push(i);
+  for (let h = 0; h < order.length; h++)
+    for (const s of succs[order[h]]) if (--indeg[s] === 0) order.push(s);
+  return order;
+})();
+
+// downstream critical-path length: the scheduling priority
+const tails = new Float64Array(N);
+for (let k = N - 1; k >= 0; k--) {
+  const i = topo[k];
+  let best = 0;
+  for (const s of succs[i]) if (tails[s] > best) best = tails[s];
+  tails[i] = T[i].dur + best;
+}
+
+// ------------------------------------------------------------- scheduling ---
+function schedule(cores) {
+  const start = new Float64Array(N), end = new Float64Array(N);
+  const indeg = T.map(t => t.deps.length);
+  const ready = new Heap((a, b) => tails[b] - tails[a] || a - b);
+  for (let i = 0; i < N; i++) if (indeg[i] === 0) ready.push(i);
+  const running = new Heap((a, b) => end[a] - end[b]);
+  let now = 0, makespan = 0;
+  while (ready.size || running.size) {
+    while (ready.size && running.size < cores) {
+      const i = ready.pop();
+      start[i] = now; end[i] = now + T[i].dur;
+      running.push(i);
+      if (end[i] > makespan) makespan = end[i];
+    }
+    if (!running.size) break;
+    const i = running.pop();
+    now = end[i];
+    for (const s of succs[i]) if (--indeg[s] === 0) ready.push(s);
+  }
+  return { start, end, makespan };
+}
+
+// pack intervals into compact display lanes
+function packLanes(items) {
+  const sorted = [...items].sort((a, b) => a.start - b.start || a.end - b.end);
+  const free = new Heap((a, b) => a.end - b.end || a.lane - b.lane);
+  const laneOf = new Map();
+  let lanes = 0;
+  for (const it of sorted) {
+    if (free.size && free.peek().end <= it.start) {
+      const l = free.pop();
+      laneOf.set(it.id, l.lane);
+      free.push({ end: it.end, lane: l.lane });
+    } else {
+      laneOf.set(it.id, lanes);
+      free.push({ end: it.end, lane: lanes });
+      lanes++;
+    }
+  }
+  return { lanes, laneOf };
+}
+
+function concurrencySteps(items) { // -> [[t, running-count], ...]
+  const ev = [];
+  for (const it of items) if (it.end > it.start) ev.push([it.start, 1], [it.end, -1]);
+  ev.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  const steps = [];
+  let c = 0;
+  for (const [t, d] of ev) {
+    c += d;
+    if (steps.length && steps[steps.length - 1][0] === t) steps[steps.length - 1][1] = c;
+    else steps.push([t, c]);
+  }
+  return steps;
+}
+
+function roundRect(g, x, y, w, h, r) {
+  r = Math.min(r, h / 2, w / 2);
+  g.beginPath();
+  g.moveTo(x + r, y);
+  g.arcTo(x + w, y, x + w, y + h, r);
+  g.arcTo(x + w, y + h, x, y + h, r);
+  g.arcTo(x, y + h, x, y, r);
+  g.arcTo(x, y, x + w, y, r);
+  g.fill();
+}
+
+function niceStep(raw) {
+  const pow = Math.pow(10, Math.floor(Math.log10(Math.max(raw, 1))));
+  for (const m of [1, 2, 5, 10]) if (m * pow >= raw) return m * pow;
+  return 10 * pow;
+}
+
+// ---------------------------------------------------------- timeline view ---
+const MAX_LANES_DRAWN = 160;
+
+class TimelineView {
+  constructor(container) {
+    this.container = container;
+    this.gantt = document.createElement("canvas");
+    this.utilLabel = document.createElement("div");
+    this.utilLabel.className = "util-label";
+    this.util = document.createElement("canvas");
+    this.note = document.createElement("div");
+    this.note.className = "lanes-note";
+    container.append(this.gantt, this.utilLabel, this.util, this.note);
+    this.highlightCp = false;
+    this.flash = null;
+    this.items = [];
+    this.zoom = 1; this.panT = 0; // panT = time at the left edge
+    this._bindEvents();
+  }
+
+  setData(items, span, capacity, utilText) {
+    this.items = items;
+    this.span = Math.max(span, 1);
+    this.capacity = capacity;
+    this.utilLabel.textContent = utilText;
+    const { lanes, laneOf } = packLanes(this.items);
+    this.lanes = Math.max(lanes, 1);
+    this.byLane = [];
+    for (const it of this.items) {
+      it.lane = laneOf.get(it.id);
+      (this.byLane[it.lane] ||= []).push(it);
+    }
+    this.byLane.forEach(l => l.sort((a, b) => a.start - b.start));
+    this.steps = concurrencySteps(this.items);
+    this.peak = Math.max(1, ...this.steps.map(s => s[1]));
+    this.maxConc = Math.max(this.peak, isFinite(capacity) ? capacity : 0);
+    this.zoom = 1; this.panT = 0;
+    this.resize();
+  }
+
+  resize() {
+    const w = this.container.clientWidth - 24;
+    if (w <= 0 || !this.items.length) return;
+    const drawn = Math.min(this.lanes, MAX_LANES_DRAWN);
+    this.laneH = Math.max(3, Math.min(16, Math.floor(440 / drawn)));
+    const h = 22 + drawn * this.laneH + 6;
+    const dpr = window.devicePixelRatio || 1;
+    for (const [cv, ch] of [[this.gantt, h], [this.util, 64]]) {
+      cv.width = Math.round(w * dpr); cv.height = Math.round(ch * dpr);
+      cv.style.width = w + "px"; cv.style.height = ch + "px";
+      cv.getContext("2d").setTransform(dpr, 0, 0, dpr, 0, 0);
+    }
+    this.w = w; this.h = h;
+    this.note.style.display = this.lanes > MAX_LANES_DRAWN ? "block" : "none";
+    this.note.textContent = `Showing ${MAX_LANES_DRAWN} of ${this.lanes} lanes — the utilization strip below covers all tasks.`;
+    this.render();
+  }
+
+  xOf(t) { return (t - this.panT) * (this.w / this.span) * this.zoom; }
+  tOf(x) { return this.panT + x / ((this.w / this.span) * this.zoom); }
+
+  render() {
+    if (!this.items.length) return;
+    const g = this.gantt.getContext("2d");
+    const colors = {};
+    for (const k of KINDS) colors[k] = kindColor(k);
+    const critical = cssVar("--critical");
+    g.clearRect(0, 0, this.w, this.h);
+
+    // time gridlines + labels
+    const step = niceStep(this.span / this.zoom / 8);
+    g.font = "10.5px system-ui, sans-serif";
+    g.strokeStyle = cssVar("--grid");
+    g.fillStyle = cssVar("--text-muted");
+    g.lineWidth = 1;
+    const tEnd = this.tOf(this.w);
+    for (let t = Math.max(0, Math.floor(this.tOf(0) / step) * step); t <= tEnd; t += step) {
+      const x = this.xOf(t);
+      if (x < -40) continue;
+      g.beginPath(); g.moveTo(x, 16); g.lineTo(x, this.h); g.stroke();
+      g.fillText(fmtMs(t), x + 3, 11);
+    }
+
+    const drawn = Math.min(this.lanes, MAX_LANES_DRAWN);
+    const gap = this.laneH > 5 ? 2 : 1;
+    for (let lane = 0; lane < drawn; lane++) {
+      const y = 22 + lane * this.laneH;
+      for (const it of this.byLane[lane] || []) {
+        const x0 = this.xOf(it.start), x1 = this.xOf(it.end);
+        if (x1 < 0) continue;
+        if (x0 > this.w) break;
+        const wpx = Math.max(x1 - x0, 1);
+        const t = T[it.id];
+        const dim = this.highlightCp && !t.cp;
+        g.globalAlpha = dim ? 0.22 : 1;
+        g.fillStyle = colors[t.kind] || colors.other;
+        if (wpx > 6 && this.laneH > 5) roundRect(g, x0, y, wpx, this.laneH - gap, 3);
+        else g.fillRect(x0, y, wpx, this.laneH - gap);
+        if (this.highlightCp && t.cp && this.laneH > 4) {
+          g.globalAlpha = 1;
+          g.strokeStyle = critical; g.lineWidth = 1.5;
+          g.strokeRect(x0 + 0.75, y + 0.75, Math.max(wpx - 1.5, 0.5), this.laneH - gap - 1.5);
+        }
+        if (this.flash && this.flash.id === it.id) {
+          g.globalAlpha = 0.5 + 0.5 * Math.sin(performance.now() / 100);
+          g.strokeStyle = critical; g.lineWidth = 3;
+          g.strokeRect(x0 - 2, y - 2, wpx + 4, this.laneH - gap + 4);
+          g.globalAlpha = 1;
+        }
+      }
+    }
+    g.globalAlpha = 1;
+
+    // utilization strip (shares the x transform)
+    const u = this.util.getContext("2d");
+    const uh = 64;
+    u.clearRect(0, 0, this.w, uh);
+    const yOf = c => uh - 2 - (c / this.maxConc) * (uh - 20);
+    u.beginPath();
+    let prevY = uh - 2;
+    u.moveTo(Math.max(this.xOf(0), 0), uh - 2);
+    for (const [t, c] of this.steps) {
+      const x = this.xOf(t);
+      u.lineTo(x, prevY); prevY = yOf(c); u.lineTo(x, prevY);
+    }
+    u.lineTo(this.w, prevY); u.lineTo(this.w, uh - 2);
+    u.closePath();
+    u.fillStyle = colors.compile; u.globalAlpha = 0.35; u.fill();
+    u.globalAlpha = 1; u.strokeStyle = colors.compile; u.lineWidth = 1.5; u.stroke();
+    if (this.capacity && isFinite(this.capacity) && this.capacity <= this.peak * 1.5) {
+      u.strokeStyle = cssVar("--text-muted");
+      u.setLineDash([4, 4]);
+      u.beginPath(); u.moveTo(0, yOf(this.capacity)); u.lineTo(this.w, yOf(this.capacity)); u.stroke();
+      u.setLineDash([]);
+      u.font = "10px system-ui, sans-serif"; u.fillStyle = cssVar("--text-muted");
+      u.fillText(this.capacity + " cores", 4, yOf(this.capacity) - 3);
+    }
+    u.font = "10px system-ui, sans-serif"; u.fillStyle = cssVar("--text-muted");
+    u.textAlign = "right";
+    u.fillText("peak " + this.peak + " running", this.w - 4, 10);
+    u.textAlign = "left";
+  }
+
+  taskAt(px, py) {
+    const lane = Math.floor((py - 22) / this.laneH);
+    if (lane < 0 || lane >= Math.min(this.lanes, MAX_LANES_DRAWN)) return null;
+    for (const it of this.byLane[lane] || []) {
+      const x0 = this.xOf(it.start), x1 = Math.max(this.xOf(it.end), x0 + 1);
+      if (px >= x0 - 1 && px <= x1 + 1) return it;
+      if (x0 > px) break;
+    }
+    return null;
+  }
+
+  focusTask(id) {
+    const it = this.items.find(i => i.id === id);
+    if (!it) return;
+    const dur = Math.max(it.end - it.start, this.span / 2000);
+    this.zoom = Math.min(Math.max(this.span / (dur * 12), 1), 2000);
+    this.panT = Math.max(0, it.start - (this.span / this.zoom - dur) / 2);
+    this.flash = { id, until: performance.now() + 1600 };
+    this.container.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    const tick = () => {
+      this.render();
+      if (this.flash && performance.now() < this.flash.until) requestAnimationFrame(tick);
+      else { this.flash = null; this.render(); }
+    };
+    tick();
+  }
+
+  _clampPan() {
+    const visSpan = this.span / this.zoom;
+    this.panT = Math.min(Math.max(this.panT, -visSpan * 0.05), this.span - visSpan * 0.95);
+  }
+
+  _bindEvents() {
+    const tip = $("tooltip");
+    this.gantt.addEventListener("wheel", e => {
+      e.preventDefault();
+      const r = this.gantt.getBoundingClientRect();
+      const px = e.clientX - r.left;
+      const tAt = this.tOf(px);
+      this.zoom = Math.min(Math.max(this.zoom * Math.exp(-e.deltaY * 0.0015), 1), 2000);
+      this.panT = tAt - px / ((this.w / this.span) * this.zoom);
+      this._clampPan();
+      this.render();
+    }, { passive: false });
+    let drag = null;
+    this.gantt.addEventListener("mousedown", e => {
+      drag = { x: e.clientX, panT: this.panT };
+      this.gantt.classList.add("dragging");
+    });
+    window.addEventListener("mouseup", () => { drag = null; this.gantt.classList.remove("dragging"); });
+    this.gantt.addEventListener("dblclick", () => { this.zoom = 1; this.panT = 0; this.render(); });
+    this.gantt.addEventListener("mousemove", e => {
+      const r = this.gantt.getBoundingClientRect();
+      if (drag) {
+        this.panT = drag.panT - (e.clientX - drag.x) / ((this.w / this.span) * this.zoom);
+        this._clampPan();
+        this.render();
+        return;
+      }
+      const it = this.taskAt(e.clientX - r.left, e.clientY - r.top);
+      if (!it) { tip.style.display = "none"; return; }
+      const t = T[it.id];
+      tip.innerHTML =
+        `<div class="tname">${esc(t.name)}</div>` +
+        `<div class="trow"><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:${kindColor(t.kind)}"></span> ` +
+        `${t.kind} · ${esc(t.ruleName)}</div>` +
+        `<div class="trow">duration ${fmtMs(it.end - it.start, true)} · ${fmtMs(it.start)} → ${fmtMs(it.end)}</div>` +
+        `<div class="trow">slack ${fmtMs(t.slack)}${t.cp ? ' · <span class="cpbadge">on critical path</span>' : ""}</div>`;
+      tip.style.display = "block";
+      tip.style.left = Math.min(e.clientX + 14, innerWidth - tip.offsetWidth - 8) + "px";
+      tip.style.top = Math.min(e.clientY + 14, innerHeight - tip.offsetHeight - 8) + "px";
+    });
+    this.gantt.addEventListener("mouseleave", () => { tip.style.display = "none"; });
+  }
+}
+
+// ------------------------------------------------------------------ setup ---
+const M = DATA.meta;
+document.title = M.title;
+$("title").textContent = M.title;
+$("meta").textContent = `${M.builddir} · generated ${M.generated} · ${M.taskCount} tasks`;
+if (M.mixedLog) $("mixedBanner").style.display = "block";
+
+const avgPar = M.work / Math.max(M.wall, 1);
+const maxSpeedup = M.work / Math.max(M.cpLength, 1);
+const tiles = [
+  [fmtMs(M.wall), "wall time", "as built"],
+  [fmtMs(M.work), "total work", "sum of all task durations"],
+  [fmtX(avgPar), "avg parallelism", `peak ${M.peakConcurrency} tasks at once`],
+  [fmtMs(M.cpLength), "critical path", (100 * M.cpLength / Math.max(M.wall, 1)).toFixed(0) + "% of wall time"],
+  [fmtX(maxSpeedup), "max speedup", "total work ÷ critical path"],
+  [String(M.taskCount), "tasks", DATA.criticalPath.length + " on the critical path"],
+];
+$("tiles").innerHTML = tiles.map(([v, l, s]) =>
+  `<div class="tile"><div class="v">${v}</div><div class="l">${l}</div><div class="s">${s}</div></div>`).join("");
+
+// legend + CP toggle (swatch colors re-applied on theme change)
+const kindsPresent = KINDS.filter(k => T.some(t => t.kind === k));
+$("legend").innerHTML =
+  kindsPresent.map(k => `<span class="chip"><span class="sw" data-kind="${k}"></span>${k}</span>`).join("") +
+  `<label><input type="checkbox" id="cpToggle"> highlight critical path</label>` +
+  `<span class="hint">wheel = zoom · drag = pan · double-click = reset</span>`;
+function paintSwatches() {
+  document.querySelectorAll(".sw[data-kind]").forEach(sw => { sw.style.background = kindColor(sw.dataset.kind); });
+  document.querySelectorAll(".pctbar[data-kind]").forEach(b => { b.style.background = kindColor(b.dataset.kind); });
+  document.querySelectorAll("[data-kindcolor]").forEach(el => { el.style.color = kindColor(el.dataset.kindcolor); });
+}
+
+// actual timeline
+const actualView = new TimelineView($("actualTimeline"));
+const actualItems = T.filter(t => t.start != null).map(t => ({ id: t.id, start: t.start, end: t.end }));
+const actualEnd = Math.max(...actualItems.map(i => i.end), 1);
+actualView.setData(actualItems, actualEnd, M.peakConcurrency, "CPU utilization — tasks running over time");
+
+// simulation
+const CORE_STEPS = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768,
+                    1024, 1536, 2048, 3072, 4096, 6144, 8192, Infinity];
+const simView = new TimelineView($("simTimeline"));
+const slider = $("coreSlider");
+slider.max = CORE_STEPS.length - 1;
+slider.value = Math.max(CORE_STEPS.findIndex(c => c >= (M.peakConcurrency || 8)), 0);
+
+function runSim() {
+  const cores = CORE_STEPS[+slider.value];
+  const res = schedule(cores);
+  const items = T.filter(t => t.dur > 0).map(t => ({ id: t.id, start: res.start[t.id], end: res.end[t.id] }));
+  $("simCoresLabel").textContent = cores === Infinity ? "∞" : cores;
+  $("simWall").textContent = fmtMs(res.makespan);
+  const ratio = M.wall / Math.max(res.makespan, 1);
+  $("simSpeedup").textContent = ratio >= 1 ? ratio.toFixed(2) + "× faster" : (1 / ratio).toFixed(2) + "× slower";
+  $("simUtil").textContent = cores === Infinity ? "–"
+    : (100 * M.work / (cores * Math.max(res.makespan, 1))).toFixed(0) + "%";
+  simView.highlightCp = $("cpToggle").checked;
+  simView.setData(items, res.makespan, cores, "simulated CPU utilization");
+}
+slider.addEventListener("input", runSim);
+
+$("cpToggle").addEventListener("change", e => {
+  actualView.highlightCp = simView.highlightCp = e.target.checked;
+  actualView.render(); simView.render();
+});
+runSim();
+
+// ---------------------------------------------------------- speedup curve ---
+let chart = null;
+function renderSpeedupChart() {
+  const el = $("speedupChart");
+  if (typeof echarts === "undefined") {
+    // offline fallback: plain table
+    el.style.display = "none";
+    const fb = $("speedupFallback");
+    fb.style.display = "block";
+    fb.innerHTML = "<table><tr><th>cores</th><th>predicted wall</th><th>speedup vs 1 core</th></tr>" +
+      M.speedup.map(p => `<tr><td>${p.cores ?? "∞"}</td><td>${fmtMs(p.makespan)}</td>` +
+        `<td>${fmtX(M.speedup[0].makespan / Math.max(p.makespan, 1))}</td></tr>`).join("") + "</table>";
+    return;
+  }
+  if (chart) chart.dispose();
+  chart = echarts.init(el, null, { renderer: "canvas" });
+  const finite = M.speedup.filter(p => p.cores != null);
+  const ink = cssVar("--text-secondary"), muted = cssVar("--text-muted"), grid = cssVar("--grid");
+  chart.setOption({
+    animation: false,
+    backgroundColor: "transparent",
+    grid: { left: 70, right: 30, top: 44, bottom: 48 },
+    legend: { top: 4, textStyle: { color: ink, fontSize: 12 }, itemWidth: 18 },
+    tooltip: {
+      trigger: "axis",
+      backgroundColor: cssVar("--surface-1"), borderColor: "rgba(128,128,128,0.3)",
+      textStyle: { color: cssVar("--text-primary"), fontSize: 12 },
+      valueFormatter: v => fmtMs(v),
+    },
+    xAxis: {
+      type: "log", logBase: 2, min: 1, max: 8192,
+      name: "cores", nameLocation: "middle", nameGap: 30, nameTextStyle: { color: muted },
+      axisLabel: { color: muted, formatter: v => v >= 1024 ? (v / 1024) + "k" : String(v) },
+      axisLine: { lineStyle: { color: grid } }, splitLine: { show: false },
+    },
+    yAxis: {
+      type: "log", name: "predicted wall time", nameTextStyle: { color: muted, align: "left" },
+      axisLabel: { color: muted, formatter: v => fmtMs(v) },
+      splitLine: { lineStyle: { color: grid } },
+    },
+    series: [
+      {
+        name: "predicted", type: "line", symbol: "circle", symbolSize: 7,
+        data: finite.map(p => [p.cores, p.makespan]),
+        lineStyle: { width: 2, color: kindColor("compile") },
+        itemStyle: { color: kindColor("compile") },
+      },
+      {
+        name: "perfect scaling (work ÷ cores)", type: "line", symbol: "none",
+        data: finite.map(p => [p.cores, M.work / p.cores]),
+        lineStyle: { width: 1.5, type: "dashed", color: muted },
+        itemStyle: { color: muted },
+      },
+      {
+        name: "critical path (floor)", type: "line", symbol: "none",
+        data: finite.map(p => [p.cores, M.cpLength]),
+        lineStyle: { width: 1.5, type: "dashed", color: cssVar("--critical") },
+        itemStyle: { color: cssVar("--critical") },
+      },
+      {
+        name: "actual build", type: "scatter", symbolSize: 11,
+        data: [[Math.max(M.peakConcurrency, 1), M.wall]],
+        itemStyle: { color: cssVar("--text-primary") },
+      },
+    ],
+  });
+}
+
+// ---------------------------------------------------------- critical path ---
+const cpTasks = DATA.criticalPath.map(id => T[id]);
+const cpByKind = {};
+cpTasks.forEach(t => { cpByKind[t.kind] = (cpByKind[t.kind] || 0) + t.dur; });
+$("cpStats").innerHTML =
+  `<div><b>${fmtMs(M.cpLength)}</b>length</div>` +
+  `<div><b>${cpTasks.length}</b>tasks</div>` +
+  Object.entries(cpByKind).sort((a, b) => b[1] - a[1]).map(([k, v]) =>
+    `<div><b data-kindcolor="${k}">${(100 * v / Math.max(M.cpLength, 1)).toFixed(0)}%</b>${k}</div>`).join("");
+
+const maxCpDur = Math.max(...cpTasks.map(t => t.dur), 1);
+$("cpTable").innerHTML =
+  "<thead><tr><th>#</th><th>task</th><th>kind</th><th class='num'>duration</th><th class='pct-cell'>share of path</th></tr></thead><tbody>" +
+  cpTasks.map((t, i) =>
+    `<tr data-id="${t.id}"><td>${i + 1}</td><td>${esc(t.name)}</td>` +
+    `<td><span class="chip"><span class="sw" data-kind="${t.kind}"></span>${t.kind}</span></td>` +
+    `<td class='num'>${fmtMs(t.dur, true)}</td>` +
+    `<td class='pct-cell'><span class="pctbar" data-kind="${t.kind}" style="width:${Math.max(Math.round(90 * t.dur / maxCpDur), 2)}px"></span>` +
+    `${(100 * t.dur / Math.max(M.cpLength, 1)).toFixed(1)}%</td></tr>`).join("") + "</tbody>";
+$("cpTable").addEventListener("click", e => {
+  const row = e.target.closest("tr[data-id]");
+  if (row) actualView.focusTask(+row.dataset.id);
+});
+
+// -------------------------------------------------------------- theme etc ---
+const themeBtn = $("themeToggle");
+const themes = ["auto", "light", "dark"];
+let themeIdx = 0;
+function repaintAll() {
+  paintSwatches();
+  actualView.render();
+  simView.render();
+  renderSpeedupChart();
+}
+themeBtn.addEventListener("click", () => {
+  themeIdx = (themeIdx + 1) % themes.length;
+  const t = themes[themeIdx];
+  if (t === "auto") delete document.documentElement.dataset.theme;
+  else document.documentElement.dataset.theme = t;
+  themeBtn.textContent = "theme: " + t;
+  requestAnimationFrame(repaintAll);
+});
+window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => requestAnimationFrame(repaintAll));
+// Re-layout on any size change, including the page becoming visible after
+// loading at zero width (window resize events alone miss that case).
+let lastW = 0;
+new ResizeObserver(() => {
+  const w = document.querySelector(".wrap").clientWidth;
+  if (w > 0 && w !== lastW) {
+    lastW = w;
+    actualView.resize(); simView.resize();
+    if (chart) chart.resize(); else renderSpeedupChart();
+  }
+}).observe(document.querySelector(".wrap"));
+
+paintSwatches();
+renderSpeedupChart();
+</script>
+</body>
+</html>
