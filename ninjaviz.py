@@ -12,6 +12,12 @@ self-contained HTML report with:
 
 Usage:
   python ninjaviz.py <build-dir> [-o report.html] [--title "My build"] [--no-deps]
+  python ninjaviz.py <build-dir> --interactive [--port 8017] [--no-open]
+
+Interactive mode serves the same report from a local Python process and adds
+compiler profiling: re-run any clang compile (or lld link) with -ftime-trace
+and see the flame chart in-page, or profile every clang TU of the build and
+aggregate the most expensive headers / templates / functions.
 """
 
 from __future__ import annotations
@@ -20,12 +26,19 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
+import threading
+import webbrowser
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
 from heapq import heappop, heappush
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlparse
 
 CORE_OPTIONS = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
 
@@ -475,17 +488,8 @@ def classify_rule(rule: str) -> str:
 # main
 # --------------------------------------------------------------------------
 
-def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("builddir", type=Path, help="ninja build directory")
-    ap.add_argument("-o", "--output", type=Path, default=Path("report.html"))
-    ap.add_argument("--title", default=None, help="report title")
-    ap.add_argument("--no-deps", action="store_true",
-                    help="skip `ninja -t deps` (generated-header dependencies)")
-    args = ap.parse_args()
-
-    builddir: Path = args.builddir.resolve()
+def build_report(builddir: Path, title: str | None, no_deps: bool):
+    """Parse the build dir; return (data dict for the template, tasks, manifest)."""
     manifest_path = builddir / "build.ninja"
     log_path = builddir / ".ninja_log"
     if not manifest_path.exists():
@@ -503,7 +507,7 @@ def main() -> None:
               "timeline shows the most recent entry per output. For accurate "
               "results use a clean full build.", file=sys.stderr)
 
-    discovered = {} if args.no_deps else parse_deps_tool(builddir, manifest)
+    discovered = {} if no_deps else parse_deps_tool(builddir, manifest)
 
     tasks, n_unlogged = build_tasks(manifest, log, discovered)
     if n_unlogged:
@@ -542,7 +546,7 @@ def main() -> None:
 
     data = {
         "meta": {
-            "title": args.title or f"Ninja build: {builddir.name}",
+            "title": title or f"Ninja build: {builddir.name}",
             "builddir": str(builddir),
             "generated": datetime.now().isoformat(timespec="seconds"),
             "wall": wall,
@@ -570,16 +574,350 @@ def main() -> None:
         "criticalPath": cp_path,
     }
 
-    template = (Path(__file__).parent / "template.html").read_text(encoding="utf-8")
-    payload = json.dumps(data, separators=(",", ":")).replace("</", "<\\/")
-    html = template.replace("/*__NINJAVIZ_DATA__*/null", payload)
-    args.output.write_text(html, encoding="utf-8")
-
     print(f"wall time      : {wall / 1000:.1f}s")
     print(f"total work     : {work / 1000:.1f}s  (avg parallelism {work / max(wall, 1):.1f}x)")
     print(f"critical path  : {cp_len / 1000:.1f}s  ({len(cp_path)} tasks, "
           f"max speedup {work / max(cp_len, 1):.1f}x)")
-    print(f"report written : {args.output}")
+    return data, tasks, manifest
+
+
+def render_html(data: dict) -> str:
+    template = (Path(__file__).parent / "template.html").read_text(encoding="utf-8")
+    payload = json.dumps(data, separators=(",", ":")).replace("</", "<\\/")
+    return template.replace("/*__NINJAVIZ_DATA__*/null", payload)
+
+
+# --------------------------------------------------------------------------
+# compiler profiling (interactive mode)
+# --------------------------------------------------------------------------
+
+_O_TOKEN = re.compile(r'-o\s+("[^"]+"|\S+)')
+
+
+def _quoted(p) -> str:
+    s = str(p)
+    return f'"{s}"' if " " in s else s
+
+
+def edge_command(builddir: Path, output: str) -> str | None:
+    """The exact command ninja runs for the edge producing `output`.
+
+    `ninja -t commands <target>` prints the whole transitive chain; the last
+    line is the requested edge's own command.
+    """
+    proc = subprocess.run(["ninja", "-C", str(builddir), "-t", "commands", output],
+                          capture_output=True, text=True, encoding="utf-8", errors="replace")
+    lines = [l for l in proc.stdout.splitlines() if l.strip()]
+    return lines[-1] if lines else None
+
+
+def profile_command(builddir: Path, cmd: str, kind: str) -> dict:
+    """Re-run a clang compile / lld link with time tracing, outputs to temp.
+
+    Rewrites the `-o <path>` token so the build tree is left untouched.
+    Returns {"events": [...]} (Chrome trace events) or {"error": "..."}.
+    """
+    lower = cmd.lower()
+    m = _O_TOKEN.search(cmd)
+    if not m:
+        return {"error": "could not find -o <output> in the command line"}
+    tmp = Path(tempfile.mkdtemp(prefix="ninjaviz_prof_"))
+    try:
+        trace = tmp / "trace.json"
+        out_ext = Path(m.group(1).strip('"')).suffix or ".out"
+        if kind == "compile" and "clang" in lower:
+            newtok = f'-o {_quoted(tmp / ("out" + out_ext))} -ftime-trace={_quoted(trace)}'
+        elif kind == "link" and "clang" in lower and "lld" in lower:
+            newtok = (f'-o {_quoted(tmp / ("out" + out_ext))} '
+                      f'-Xlinker --time-trace={_quoted(trace)}')
+        else:
+            return {"error": "profiling is supported for clang compile steps "
+                             "and clang+lld link steps only"}
+        modified = cmd[:m.start()] + newtok + cmd[m.end():]
+        proc = subprocess.run(modified, shell=True, cwd=builddir,
+                              capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=600)
+        if not trace.exists():
+            tail = (proc.stderr or proc.stdout or "").strip()[-800:]
+            return {"error": f"no trace produced (exit {proc.returncode}): {tail}"}
+        events = json.loads(trace.read_text(encoding="utf-8")).get("traceEvents", [])
+        out = [e for e in events if e.get("ph") == "X" and e.get("dur", 0) > 0]
+        # Newer clang emits Source (include) spans as async begin/end pairs
+        # (ph "b"/"e") instead of complete "X" events — stitch them together.
+        stacks: dict[tuple, list] = {}
+        for e in events:
+            ph = e.get("ph")
+            key = (e.get("tid"), e.get("cat"), e.get("id"))
+            if ph == "b":
+                stacks.setdefault(key, []).append(e)
+            elif ph == "e" and stacks.get(key):
+                b = stacks[key].pop()
+                dur = e.get("ts", 0) - b.get("ts", 0)
+                if dur > 0:
+                    out.append({"ph": "X", "name": b.get("name", "?"),
+                                "ts": b.get("ts"), "dur": dur,
+                                "tid": b.get("tid"), "pid": b.get("pid"),
+                                "args": b.get("args") or {}})
+        return {"events": out}
+    except subprocess.TimeoutExpired:
+        return {"error": "command timed out after 600s"}
+    except Exception as exc:  # surface anything to the UI rather than a 500
+        return {"error": f"{type(exc).__name__}: {exc}"}
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def demangle_names(names: list[str]) -> list[str]:
+    """Best-effort symbol demangling via whatever tool is on PATH.
+
+    llvm-undname/undname handle MSVC (?...) names, llvm-cxxfilt/c++filt handle
+    Itanium (_Z...) names. Tools pass through names they can't demangle, so
+    trying them in sequence is safe; with no tool available this is a no-op.
+    """
+    out = list(names)
+    for tool in ("llvm-undname", "undname", "llvm-cxxfilt", "c++filt"):
+        exe = shutil.which(tool)
+        if not exe:
+            continue
+        try:
+            proc = subprocess.run([exe], input="\n".join(out), capture_output=True,
+                                  text=True, encoding="utf-8", errors="replace",
+                                  timeout=30)
+            lines = proc.stdout.splitlines()
+            if proc.returncode == 0 and len(lines) == len(out):
+                out = [l.strip() or o for l, o in zip(lines, out)]
+        except Exception:
+            pass
+    return out
+
+
+def profile_build_job(bridge: "Bridge", job: dict) -> None:
+    """Re-compile every clang TU with -ftime-trace and aggregate the results
+    (a small in-process ClangBuildAnalyzer)."""
+    try:
+        proc = subprocess.run(["ninja", "-C", str(bridge.builddir), "-t", "commands"],
+                              capture_output=True, text=True,
+                              encoding="utf-8", errors="replace")
+        cmd_by_output: dict[str, str] = {}
+        for line in proc.stdout.splitlines():
+            l = line.strip()
+            if not l or "clang" not in l.lower() or " -c " not in l:
+                continue
+            m = _O_TOKEN.search(l)
+            if m:
+                cmd_by_output[bridge.manifest.norm(m.group(1).strip('"'))] = l
+
+        targets: list[tuple[int, str]] = []
+        for t in bridge.tasks:
+            if classify_rule(t.edge.rule) != "compile":
+                continue
+            for o in t.edge.outputs:
+                if o in cmd_by_output:
+                    targets.append((t.id, cmd_by_output[o]))
+                    break
+        job["total"] = len(targets)
+        if not targets:
+            job.update(state="error", error="no clang compile commands found")
+            return
+
+        lock = threading.Lock()
+        headers: dict[str, list] = {}     # path -> [total_us, count]
+        templates: dict[str, list] = {}
+        functions: dict[str, list] = {}
+        tus: list[dict] = []
+        totals = {"frontend": 0, "backend": 0}
+        failed = 0
+
+        def add(table, key, dur):
+            e = table.setdefault(key, [0, 0])
+            e[0] += dur
+            e[1] += 1
+
+        def one(item):
+            nonlocal failed
+            tid, cmd = item
+            res = profile_command(bridge.builddir, cmd, "compile")
+            with lock:
+                job["done"] += 1
+                if "error" in res:
+                    failed += 1
+                    return
+                tu = {"task": tid, "total": 0, "frontend": 0, "backend": 0}
+                for e in res["events"]:
+                    name, dur = e.get("name", ""), e.get("dur", 0)
+                    detail = (e.get("args") or {}).get("detail", "")
+                    if name == "ExecuteCompiler":
+                        tu["total"] = max(tu["total"], dur)
+                    elif name == "Total Frontend":
+                        tu["frontend"] = dur
+                        totals["frontend"] += dur
+                    elif name == "Total Backend":
+                        tu["backend"] = dur
+                        totals["backend"] += dur
+                    elif name == "Source" and detail:
+                        add(headers, detail, dur)
+                    elif name in ("InstantiateClass", "InstantiateFunction") and detail:
+                        add(templates, detail, dur)
+                    elif name in ("OptFunction", "CodeGen Function") and detail:
+                        add(functions, detail, dur)
+                tus.append(tu)
+
+        with ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as ex:
+            list(ex.map(one, targets))
+
+        def top(table, n=25, demangle=False):
+            rows = sorted(table.items(), key=lambda kv: -kv[1][0])[:n]
+            names = [k for k, _ in rows]
+            if demangle:
+                names = demangle_names(names)
+            return [{"name": name, "ms": round(v[0] / 1000), "count": v[1]}
+                    for name, (_, v) in zip(names, rows)]
+
+        tus.sort(key=lambda t: -t["total"])
+        job["result"] = {
+            "tusProfiled": len(tus),
+            "failed": failed,
+            "frontendMs": round(totals["frontend"] / 1000),
+            "backendMs": round(totals["backend"] / 1000),
+            "slowestTus": [{"task": t["task"], "ms": round(t["total"] / 1000),
+                            "frontendMs": round(t["frontend"] / 1000),
+                            "backendMs": round(t["backend"] / 1000)}
+                           for t in tus[:25]],
+            "topHeaders": top(headers),
+            "topTemplates": top(templates),
+            "topFunctions": top(functions, demangle=True),
+            "note": "header/template/function times are inclusive sums across "
+                    "all TUs (like ClangBuildAnalyzer), so nested entries overlap",
+        }
+        job["state"] = "done"
+    except Exception as exc:
+        job.update(state="error", error=f"{type(exc).__name__}: {exc}")
+
+
+# --------------------------------------------------------------------------
+# interactive mode: HTTP bridge
+# --------------------------------------------------------------------------
+
+class Bridge:
+    def __init__(self, builddir: Path, html: str, tasks: list[Task],
+                 manifest: NinjaManifest):
+        self.builddir = builddir
+        self.html = html
+        self.tasks = tasks
+        self.manifest = manifest
+        self.jobs: dict[str, dict] = {}
+        self._job_seq = 0
+        self.lock = threading.Lock()
+
+    def new_job(self) -> tuple[str, dict]:
+        with self.lock:
+            self._job_seq += 1
+            jid = f"job{self._job_seq}"
+            job = {"state": "running", "done": 0, "total": 0}
+            self.jobs[jid] = job
+        return jid, job
+
+
+def serve(bridge: Bridge, port: int, open_browser: bool) -> None:
+    class Handler(BaseHTTPRequestHandler):
+        def _json(self, obj, code=200):
+            body = json.dumps(obj).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            path = urlparse(self.path).path
+            if path in ("/", "/report.html"):
+                body = bridge.html.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            elif path == "/api/ping":
+                self._json({"ok": True, "builddir": str(bridge.builddir)})
+            elif path.startswith("/api/job/"):
+                job = bridge.jobs.get(path.rsplit("/", 1)[1])
+                if not job:
+                    self._json({"error": "unknown job"}, 404)
+                else:
+                    self._json(job)
+            else:
+                self._json({"error": "not found"}, 404)
+
+        def do_POST(self):
+            path = urlparse(self.path).path
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(length) or b"{}")
+            except Exception:
+                self._json({"error": "bad request body"}, 400)
+                return
+            if path == "/api/profile-task":
+                tid = body.get("task")
+                if not isinstance(tid, int) or not 0 <= tid < len(bridge.tasks):
+                    self._json({"error": "unknown task id"}, 400)
+                    return
+                task = bridge.tasks[tid]
+                kind = classify_rule(task.edge.rule)
+                cmd = edge_command(bridge.builddir, task.edge.display)
+                if not cmd:
+                    self._json({"error": "ninja -t commands returned nothing "
+                                         "for " + task.edge.display})
+                    return
+                print(f"profiling task {tid}: {task.edge.display}")
+                self._json(profile_command(bridge.builddir, cmd, kind))
+            elif path == "/api/profile-build":
+                jid, job = bridge.new_job()
+                print("profiling whole build (all clang TUs, -ftime-trace)...")
+                threading.Thread(target=profile_build_job, args=(bridge, job),
+                                 daemon=True).start()
+                self._json({"job": jid})
+            else:
+                self._json({"error": "not found"}, 404)
+
+        def log_message(self, *a):  # quiet
+            pass
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    url = f"http://127.0.0.1:{httpd.server_address[1]}/"
+    print(f"interactive mode: serving report at {url}  (Ctrl+C to stop)")
+    if open_browser:
+        webbrowser.open(url)
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\nstopped")
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("builddir", type=Path, help="ninja build directory")
+    ap.add_argument("-o", "--output", type=Path, default=Path("report.html"))
+    ap.add_argument("--title", default=None, help="report title")
+    ap.add_argument("--no-deps", action="store_true",
+                    help="skip `ninja -t deps` (generated-header dependencies)")
+    ap.add_argument("--interactive", action="store_true",
+                    help="serve the report from a live process with compiler "
+                         "profiling (clang -ftime-trace) instead of writing a file")
+    ap.add_argument("--port", type=int, default=8017, help="interactive mode port")
+    ap.add_argument("--no-open", action="store_true",
+                    help="interactive mode: don't open the browser automatically")
+    args = ap.parse_args()
+
+    builddir: Path = args.builddir.resolve()
+    data, tasks, manifest = build_report(builddir, args.title, args.no_deps)
+    html = render_html(data)
+
+    if args.interactive:
+        serve(Bridge(builddir, html, tasks, manifest), args.port, not args.no_open)
+    else:
+        args.output.write_text(html, encoding="utf-8")
+        print(f"report written : {args.output}")
 
 
 if __name__ == "__main__":

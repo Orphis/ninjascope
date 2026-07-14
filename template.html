@@ -73,7 +73,7 @@
   h1 { font-size: 22px; margin: 0; font-weight: 650; }
   .meta { color: var(--text-muted); font-size: 12.5px; }
   #themeToggle {
-    margin-left: auto; border: 1px solid var(--border); background: var(--surface-1);
+    border: 1px solid var(--border); background: var(--surface-1);
     color: var(--text-secondary); border-radius: 8px; padding: 4px 10px; cursor: pointer;
     font: inherit; font-size: 12.5px;
   }
@@ -141,6 +141,54 @@
   .pctbar { display: inline-block; height: 8px; border-radius: 3px; vertical-align: middle; margin-right: 8px; }
   .cp-stats { display: flex; gap: 26px; flex-wrap: wrap; margin: 8px 0 14px; font-size: 12px; color: var(--text-muted); }
   .cp-stats b { display: block; font-size: 17px; font-weight: 650; color: var(--text-primary); }
+
+  .detail-head { display: flex; align-items: center; gap: 10px; }
+  .detail-head b { font-size: 14px; word-break: break-all; }
+  .detail-head button {
+    border: 1px solid var(--border); background: transparent; flex: none;
+    color: var(--text-muted); border-radius: 6px; width: 24px; height: 24px; cursor: pointer;
+  }
+  .detail-head .spacer { margin-left: auto; }
+  /* maximized: the detail panel becomes a full-viewport overlay so the flame
+     graph gets real estate; lanes switch to a fixed readable height */
+  #detailSection.maximized > .panel {
+    position: fixed; inset: 14px; z-index: 20; overflow: auto;
+    box-shadow: 0 10px 48px rgba(0,0,0,0.45);
+  }
+  #flameBody { display: flex; flex-direction: column; gap: 14px; margin-top: 8px; }
+  #flameTimeline { min-width: 0; flex: 1 1 auto; }
+  @media (min-width: 1200px) {
+    /* wide screens: expensive-entries tables sit beside the flame graph so
+       the flame keeps the full width for depth */
+    #flameBody { flex-direction: row; align-items: flex-start; }
+    #flameSummary { flex: 0 0 420px; flex-direction: column; margin-top: 0; }
+    #flameSummary table { flex: none; width: 100%; }
+  }
+  .detail-info { display: flex; gap: 24px; flex-wrap: wrap; margin: 10px 0; font-size: 12px; color: var(--text-muted); }
+  .detail-info b { display: block; font-size: 14px; font-weight: 600; color: var(--text-primary); }
+  .detail-actions { display: flex; align-items: center; gap: 12px; margin: 4px 0 8px; font-size: 12.5px; color: var(--text-muted); }
+  .btn {
+    border: 1px solid var(--border); background: var(--page); color: var(--text-primary);
+    border-radius: 8px; padding: 5px 12px; cursor: pointer; font: inherit; font-size: 12.5px;
+  }
+  .btn:disabled { opacity: 0.55; cursor: default; }
+  .btn-mini { padding: 1px 8px; margin-left: 8px; font-size: 11px; }
+  .util-label b { color: var(--text-secondary); font-weight: 600; }
+  .profile-error { color: var(--critical); font-size: 12.5px; white-space: pre-wrap; word-break: break-all; }
+  #flameSummary { display: flex; gap: 20px; flex-wrap: wrap; margin-top: 12px; }
+  #flameSummary table { border-collapse: collapse; font-size: 12px; flex: 1 1 320px; }
+  #flameSummary th, #flameSummary td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--grid); font-variant-numeric: tabular-nums; }
+  #flameSummary th { color: var(--text-muted); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; }
+  #flameSummary td.num, .bp-grid td.num { text-align: right; white-space: nowrap; }
+  .trunc { max-width: 420px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block; vertical-align: bottom; }
+
+  .bp-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(440px, 1fr)); gap: 12px; }
+  .bp-grid h3 { font-size: 12px; margin: 2px 4px 8px; color: var(--text-secondary); font-weight: 600; }
+  .bp-grid table { border-collapse: collapse; width: 100%; font-size: 12px; }
+  .bp-grid th, .bp-grid td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--grid); font-variant-numeric: tabular-nums; }
+  .bp-grid th { color: var(--text-muted); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; }
+  .bp-grid tr[data-id] { cursor: pointer; }
+  .bp-grid tr[data-id]:hover { background: color-mix(in srgb, var(--text-primary) 5%, transparent); }
 </style>
 </head>
 <body>
@@ -148,7 +196,10 @@
   <header>
     <h1 id="title"></h1>
     <div class="meta" id="meta"></div>
-    <button id="themeToggle" title="Toggle color theme">theme: auto</button>
+    <div style="margin-left:auto; display:flex; gap:8px; align-items:center">
+      <button class="btn" id="profileBuildBtn" style="display:none">profile whole build</button>
+      <button id="themeToggle" title="Toggle color theme">theme: auto</button>
+    </div>
   </header>
   <div class="banner" id="mixedBanner" style="display:none">
     ⚠ The ninja log contains entries from multiple builds — the timeline shows the most
@@ -179,10 +230,47 @@
     <div class="panel timeline" id="simTimeline"></div>
   </section>
 
+  <section id="detailSection" style="display:none">
+    <h2>Task detail</h2>
+    <p class="sub">Selected from the timeline — click any bar above to inspect a task.</p>
+    <div class="panel">
+      <div class="detail-head">
+        <span class="chip"><span class="sw" id="detailKindSw"></span><span id="detailKind"></span></span>
+        <b id="detailName"></b>
+        <span class="spacer"></span>
+        <button id="detailMax" title="Maximize (Esc to restore)">⛶</button>
+        <button id="detailClose" title="Close">×</button>
+      </div>
+      <div class="detail-info" id="detailInfo"></div>
+      <div class="detail-actions" id="detailActions"></div>
+      <div id="flameArea" style="display:none">
+        <div class="util-label" id="flameLabel"></div>
+        <div id="flameBody">
+          <div class="timeline" id="flameTimeline"></div>
+          <div id="flameSummary"></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
   <section>
     <h2>Speedup curve</h2>
     <p class="sub">Predicted wall time vs. core count. The curve can never cross the critical path — past the knee, adding cores buys nothing.</p>
     <div class="panel"><div id="speedupChart"></div><div class="fallback-table" id="speedupFallback" style="display:none"></div></div>
+  </section>
+
+  <section id="buildProfileSection" style="display:none">
+    <h2>Whole-build compiler profile</h2>
+    <p class="sub">Every clang translation unit re-compiled with <code>-ftime-trace</code> and aggregated —
+      the code-level "why" behind the slow tasks. Times are inclusive sums across all TUs
+      (nested entries overlap), like ClangBuildAnalyzer.</p>
+    <div class="cp-stats" id="bpStats"></div>
+    <div class="bp-grid">
+      <div class="panel cp-table"><h3>Slowest translation units</h3><table id="bpTus"></table></div>
+      <div class="panel cp-table"><h3>Most expensive headers (includes)</h3><table id="bpHeaders"></table></div>
+      <div class="panel cp-table"><h3>Most expensive template instantiations</h3><table id="bpTemplates"></table></div>
+      <div class="panel cp-table"><h3>Most expensive functions (codegen + opt)</h3><table id="bpFunctions"></table></div>
+    </div>
   </section>
 
   <section>
@@ -206,6 +294,7 @@ const kindColor = kind => cssVar("--kind-" + (KINDS.includes(kind) ? kind : "oth
 
 function fmtMs(ms, precise) {
   if (ms == null) return "–";
+  if (precise && ms < 100) return (ms < 10 ? ms.toFixed(2) : Math.round(ms)) + " ms";
   if (precise && ms < 10000) return (ms / 1000).toFixed(2) + " s";
   if (ms < 1000) return Math.round(ms) + " ms";
   if (ms < 90000) return (ms / 1000).toFixed(1) + " s";
@@ -345,12 +434,30 @@ function niceStep(raw) {
   return 10 * pow;
 }
 
+function contrastInk(hex) {
+  // readable text color on top of a series-colored bar
+  if (!/^#[0-9a-f]{6}$/i.test(hex || "")) return "#ffffff";
+  const n = parseInt(hex.slice(1), 16);
+  const lum = (0.299 * ((n >> 16) & 255) + 0.587 * ((n >> 8) & 255) + 0.114 * (n & 255)) / 255;
+  return lum > 0.62 ? "#0b0b0b" : "#ffffff";
+}
+
+function primaryInk(alpha) {
+  // --text-primary as rgba: darkens bars in light mode, brightens in dark
+  const hex = cssVar("--text-primary");
+  if (!/^#[0-9a-f]{6}$/i.test(hex)) return `rgba(255,255,255,${alpha})`;
+  const n = parseInt(hex.slice(1), 16);
+  return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${alpha})`;
+}
+
 // ---------------------------------------------------------- timeline view ---
 const MAX_LANES_DRAWN = 160;
 
 class TimelineView {
-  constructor(container) {
+  // opts: { info(it)->{kind,cp}, tip(it)->html, onSelect(it), prePacked, util:false }
+  constructor(container, opts = {}) {
     this.container = container;
+    this.opts = opts;
     this.gantt = document.createElement("canvas");
     this.utilLabel = document.createElement("div");
     this.utilLabel.className = "util-label";
@@ -358,11 +465,25 @@ class TimelineView {
     this.note = document.createElement("div");
     this.note.className = "lanes-note";
     container.append(this.gantt, this.utilLabel, this.util, this.note);
+    if (opts.util === false) { this.util.style.display = "none"; this.utilLabel.style.display = "none"; }
     this.highlightCp = false;
     this.flash = null;
+    this.hoverId = null;
     this.items = [];
     this.zoom = 1; this.panT = 0; // panT = time at the left edge
     this._bindEvents();
+  }
+
+  _info(it) { return this.opts.info ? this.opts.info(it) : T[it.id]; }
+
+  _tip(it) {
+    if (this.opts.tip) return this.opts.tip(it);
+    const t = T[it.id];
+    return `<div class="tname">${esc(t.name)}</div>` +
+      `<div class="trow"><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:${kindColor(t.kind)}"></span> ` +
+      `${t.kind} · ${esc(t.ruleName)}</div>` +
+      `<div class="trow">duration ${fmtMs(it.end - it.start, true)} · ${fmtMs(it.start)} → ${fmtMs(it.end)}</div>` +
+      `<div class="trow">slack ${fmtMs(t.slack)}${t.cp ? ' · <span class="cpbadge">on critical path</span>' : ""}</div>`;
   }
 
   setData(items, span, capacity, utilText) {
@@ -370,13 +491,15 @@ class TimelineView {
     this.span = Math.max(span, 1);
     this.capacity = capacity;
     this.utilLabel.textContent = utilText;
-    const { lanes, laneOf } = packLanes(this.items);
-    this.lanes = Math.max(lanes, 1);
-    this.byLane = [];
-    for (const it of this.items) {
-      it.lane = laneOf.get(it.id);
-      (this.byLane[it.lane] ||= []).push(it);
+    if (this.opts.prePacked) {
+      this.lanes = Math.max(1, ...this.items.map(it => it.lane + 1));
+    } else {
+      const { lanes, laneOf } = packLanes(this.items);
+      this.lanes = Math.max(lanes, 1);
+      this.items.forEach(it => { it.lane = laneOf.get(it.id); });
     }
+    this.byLane = [];
+    for (const it of this.items) (this.byLane[it.lane] ||= []).push(it);
     this.byLane.forEach(l => l.sort((a, b) => a.start - b.start));
     this.steps = concurrencySteps(this.items);
     this.peak = Math.max(1, ...this.steps.map(s => s[1]));
@@ -388,9 +511,10 @@ class TimelineView {
   resize() {
     const w = this.container.clientWidth - 24;
     if (w <= 0 || !this.items.length) return;
-    const drawn = Math.min(this.lanes, MAX_LANES_DRAWN);
-    this.laneH = Math.max(3, Math.min(16, Math.floor(440 / drawn)));
-    const h = 22 + drawn * this.laneH + 6;
+    const maxLanes = this.opts.maxLanes ?? MAX_LANES_DRAWN;
+    this.drawn = Math.min(this.lanes, maxLanes);
+    this.laneH = this.opts.laneH ?? Math.max(3, Math.min(16, Math.floor(440 / this.drawn)));
+    const h = 22 + this.drawn * this.laneH + 6;
     const dpr = window.devicePixelRatio || 1;
     for (const [cv, ch] of [[this.gantt, h], [this.util, 64]]) {
       cv.width = Math.round(w * dpr); cv.height = Math.round(ch * dpr);
@@ -398,8 +522,9 @@ class TimelineView {
       cv.getContext("2d").setTransform(dpr, 0, 0, dpr, 0, 0);
     }
     this.w = w; this.h = h;
-    this.note.style.display = this.lanes > MAX_LANES_DRAWN ? "block" : "none";
-    this.note.textContent = `Showing ${MAX_LANES_DRAWN} of ${this.lanes} lanes — the utilization strip below covers all tasks.`;
+    this.note.style.display = this.lanes > this.drawn ? "block" : "none";
+    this.note.textContent = `Showing ${this.drawn} of ${this.lanes} lanes` +
+      (this.opts.util === false ? "." : " — the utilization strip below covers all tasks.");
     this.render();
   }
 
@@ -428,21 +553,48 @@ class TimelineView {
       g.fillText(fmtMs(t), x + 3, 11);
     }
 
-    const drawn = Math.min(this.lanes, MAX_LANES_DRAWN);
     const gap = this.laneH > 5 ? 2 : 1;
-    for (let lane = 0; lane < drawn; lane++) {
+    const labels = !!this.opts.label && this.laneH >= 9;
+    const ink = {};
+    if (labels) for (const k of KINDS) ink[k] = contrastInk(colors[k]);
+    if (labels) g.textBaseline = "middle";
+    for (let lane = 0; lane < this.drawn; lane++) {
       const y = 22 + lane * this.laneH;
       for (const it of this.byLane[lane] || []) {
         const x0 = this.xOf(it.start), x1 = this.xOf(it.end);
         if (x1 < 0) continue;
         if (x0 > this.w) break;
         const wpx = Math.max(x1 - x0, 1);
-        const t = T[it.id];
+        const t = this._info(it);
         const dim = this.highlightCp && !t.cp;
-        g.globalAlpha = dim ? 0.22 : 1;
+        const hovered = this.hoverId === it.id;
+        g.globalAlpha = dim && !hovered ? 0.22 : 1;
         g.fillStyle = colors[t.kind] || colors.other;
         if (wpx > 6 && this.laneH > 5) roundRect(g, x0, y, wpx, this.laneH - gap, 3);
         else g.fillRect(x0, y, wpx, this.laneH - gap);
+        if (hovered) {
+          g.globalAlpha = 1;
+          g.fillStyle = primaryInk(0.14);
+          g.fillRect(x0, y, wpx, this.laneH - gap);
+          g.strokeStyle = primaryInk(1); g.lineWidth = 1.5;
+          g.strokeRect(x0 + 0.75, y + 0.75, Math.max(wpx - 1.5, 0.5), Math.max(this.laneH - gap - 1.5, 1));
+        }
+        const wantLabel = labels && (wpx >= 36 || (hovered && wpx >= 20));
+        if (wantLabel) {
+          // pin the label to the visible part of the bar, clipped to it
+          const cx0 = Math.max(x0, 0), cx1 = Math.min(x1, this.w);
+          if (cx1 - cx0 >= 20) {
+            g.save();
+            g.beginPath();
+            g.rect(cx0 + 3, y, cx1 - cx0 - 6, this.laneH - gap);
+            g.clip();
+            g.fillStyle = ink[t.kind] || "#ffffff";
+            g.font = (hovered ? "600 " : "") +
+              (this.laneH >= 15 ? 11.5 : this.laneH >= 13 ? 10.5 : 9) + "px system-ui, sans-serif";
+            g.fillText(this.opts.label(it), cx0 + 5, y + (this.laneH - gap) / 2 + 0.5);
+            g.restore();
+          }
+        }
         if (this.highlightCp && t.cp && this.laneH > 4) {
           g.globalAlpha = 1;
           g.strokeStyle = critical; g.lineWidth = 1.5;
@@ -457,8 +609,10 @@ class TimelineView {
       }
     }
     g.globalAlpha = 1;
+    if (labels) g.textBaseline = "alphabetic";
 
     // utilization strip (shares the x transform)
+    if (this.opts.util === false) return;
     const u = this.util.getContext("2d");
     const uh = 64;
     u.clearRect(0, 0, this.w, uh);
@@ -490,7 +644,7 @@ class TimelineView {
 
   taskAt(px, py) {
     const lane = Math.floor((py - 22) / this.laneH);
-    if (lane < 0 || lane >= Math.min(this.lanes, MAX_LANES_DRAWN)) return null;
+    if (lane < 0 || lane >= this.drawn) return null;
     for (const it of this.byLane[lane] || []) {
       const x0 = this.xOf(it.start), x1 = Math.max(this.xOf(it.end), x0 + 1);
       if (px >= x0 - 1 && px <= x1 + 1) return it;
@@ -534,33 +688,48 @@ class TimelineView {
     }, { passive: false });
     let drag = null;
     this.gantt.addEventListener("mousedown", e => {
-      drag = { x: e.clientX, panT: this.panT };
+      drag = { x: e.clientX, panT: this.panT, moved: false };
       this.gantt.classList.add("dragging");
     });
-    window.addEventListener("mouseup", () => { drag = null; this.gantt.classList.remove("dragging"); });
+    window.addEventListener("mouseup", () => {
+      this._suppressClick = drag ? drag.moved : false;
+      drag = null;
+      this.gantt.classList.remove("dragging");
+    });
+    this.gantt.addEventListener("click", e => {
+      if (this._suppressClick || !this.opts.onSelect) return;
+      const r = this.gantt.getBoundingClientRect();
+      const it = this.taskAt(e.clientX - r.left, e.clientY - r.top);
+      if (it) this.opts.onSelect(it);
+    });
     this.gantt.addEventListener("dblclick", () => { this.zoom = 1; this.panT = 0; this.render(); });
     this.gantt.addEventListener("mousemove", e => {
       const r = this.gantt.getBoundingClientRect();
       if (drag) {
+        if (Math.abs(e.clientX - drag.x) > 4) drag.moved = true;
         this.panT = drag.panT - (e.clientX - drag.x) / ((this.w / this.span) * this.zoom);
         this._clampPan();
         this.render();
         return;
       }
       const it = this.taskAt(e.clientX - r.left, e.clientY - r.top);
+      const hid = it ? it.id : null;
+      if (hid !== this.hoverId) {
+        this.hoverId = hid;
+        this.render();
+      }
+      this.gantt.style.cursor = it ? "pointer" : "";
       if (!it) { tip.style.display = "none"; return; }
-      const t = T[it.id];
-      tip.innerHTML =
-        `<div class="tname">${esc(t.name)}</div>` +
-        `<div class="trow"><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:${kindColor(t.kind)}"></span> ` +
-        `${t.kind} · ${esc(t.ruleName)}</div>` +
-        `<div class="trow">duration ${fmtMs(it.end - it.start, true)} · ${fmtMs(it.start)} → ${fmtMs(it.end)}</div>` +
-        `<div class="trow">slack ${fmtMs(t.slack)}${t.cp ? ' · <span class="cpbadge">on critical path</span>' : ""}</div>`;
+      tip.innerHTML = this._tip(it);
       tip.style.display = "block";
       tip.style.left = Math.min(e.clientX + 14, innerWidth - tip.offsetWidth - 8) + "px";
       tip.style.top = Math.min(e.clientY + 14, innerHeight - tip.offsetHeight - 8) + "px";
     });
-    this.gantt.addEventListener("mouseleave", () => { tip.style.display = "none"; });
+    this.gantt.addEventListener("mouseleave", () => {
+      tip.style.display = "none";
+      this.gantt.style.cursor = "";
+      if (this.hoverId !== null) { this.hoverId = null; this.render(); }
+    });
   }
 }
 
@@ -597,7 +766,7 @@ function paintSwatches() {
 }
 
 // actual timeline
-const actualView = new TimelineView($("actualTimeline"));
+const actualView = new TimelineView($("actualTimeline"), { onSelect: it => showDetail(it.id) });
 const actualItems = T.filter(t => t.start != null).map(t => ({ id: t.id, start: t.start, end: t.end }));
 const actualEnd = Math.max(...actualItems.map(i => i.end), 1);
 actualView.setData(actualItems, actualEnd, M.peakConcurrency, "CPU utilization — tasks running over time");
@@ -605,7 +774,7 @@ actualView.setData(actualItems, actualEnd, M.peakConcurrency, "CPU utilization �
 // simulation
 const CORE_STEPS = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768,
                     1024, 1536, 2048, 3072, 4096, 6144, 8192, Infinity];
-const simView = new TimelineView($("simTimeline"));
+const simView = new TimelineView($("simTimeline"), { onSelect: it => showDetail(it.id) });
 const slider = $("coreSlider");
 slider.max = CORE_STEPS.length - 1;
 slider.value = Math.max(CORE_STEPS.findIndex(c => c >= (M.peakConcurrency || 8)), 0);
@@ -630,6 +799,268 @@ $("cpToggle").addEventListener("change", e => {
   actualView.render(); simView.render();
 });
 runSim();
+
+// ------------------------------------------- bridge (interactive mode) ---
+// The same page is served either as a static file or by `ninjaviz.py
+// --interactive`. Feature-detect the live Python process; only then show
+// the profiling UI. On file:// the fetch throws and we stay static.
+let BRIDGE = null;
+fetch("/api/ping").then(r => (r.ok ? r.json() : null)).then(info => {
+  if (info && info.ok) {
+    BRIDGE = info;
+    $("profileBuildBtn").style.display = "";
+    if (selectedTask != null) showDetail(selectedTask); // refresh actions row
+  }
+}).catch(() => {});
+
+// ------------------------------------------------------- task detail ---
+let selectedTask = null;
+let flameView = null;
+
+function showDetail(id) {
+  selectedTask = id;
+  const t = T[id];
+  $("detailSection").style.display = "";
+  $("detailKindSw").style.background = kindColor(t.kind);
+  $("detailKind").textContent = t.kind;
+  $("detailName").textContent = t.name;
+  const dependents = succs[id].length;
+  $("detailInfo").innerHTML = [
+    [fmtMs(t.dur, true), "duration"],
+    [t.start != null ? fmtMs(t.start) + " → " + fmtMs(t.end) : "not built", "actual run"],
+    [fmtMs(t.slack), "slack"],
+    [t.cp ? "yes" : "no", "critical path"],
+    [String(t.deps.length), "direct deps"],
+    [String(dependents), "dependents"],
+    [esc(t.ruleName), "ninja rule"],
+  ].map(([v, l]) => `<div><b>${v}</b>${l}</div>`).join("");
+
+  const act = $("detailActions");
+  act.innerHTML = "";
+  $("flameArea").style.display = "none";
+  if (BRIDGE && (t.kind === "compile" || t.kind === "link")) {
+    const btn = document.createElement("button");
+    btn.className = "btn";
+    btn.textContent = "Profile with -ftime-trace";
+    btn.addEventListener("click", () => profileTask(id, btn));
+    act.append(btn);
+    const note = document.createElement("span");
+    note.textContent = "re-runs this step with tracing; outputs go to a temp dir, the build tree is untouched";
+    act.append(note);
+  } else if (BRIDGE) {
+    act.innerHTML = `<span>profiling is available for clang compile and lld link steps</span>`;
+  } else {
+    act.innerHTML = `<span>run <code>ninjaviz.py ${esc(M.builddir)} --interactive</code> to enable compiler profiling</span>`;
+  }
+}
+$("detailClose").addEventListener("click", () => {
+  $("detailSection").style.display = "none";
+  setDetailMax(false);
+  selectedTask = null;
+});
+
+// maximize: full-viewport overlay; flame lanes switch to a fixed readable
+// height and the depth cap is lifted so the whole stack is visible
+let detailMax = false;
+function applyDetailMax() {
+  if (!flameView) return;
+  flameView.opts.laneH = detailMax ? 14 : null;
+  flameView.opts.maxLanes = detailMax ? 1024 : null;
+  flameView.resize();
+}
+function setDetailMax(on) {
+  if (detailMax === on) return;
+  detailMax = on;
+  $("detailSection").classList.toggle("maximized", on);
+  $("detailMax").textContent = on ? "🗗" : "⛶";
+  $("detailMax").title = on ? "Restore (Esc)" : "Maximize (Esc to restore)";
+  applyDetailMax();
+}
+$("detailMax").addEventListener("click", () => setDetailMax(!detailMax));
+document.addEventListener("keydown", e => { if (e.key === "Escape") setDetailMax(false); });
+
+// --------------------------------------------------------- flame chart ---
+function flameKind(name) {
+  if (name === "Source") return "compile";                         // includes
+  if (/^(Instantiate|Parse|Sema|Debug|PerformPendingInstantiations|Frontend)/.test(name)) return "codegen"; // frontend
+  if (/CodeGen|^Opt|Pass|Backend|Module/.test(name)) return "archive";  // backend
+  return "other";
+}
+
+let flameAll = [], flameTotal = 1, flameTaskName = "", flameRootId = null;
+
+// reframe the flame graph on one frame + its descendants (null = show all);
+// with fewer lanes visible, lane height and label text scale back up
+function setFlameFrame(rootId) {
+  flameRootId = rootId;
+  let items, span;
+  if (rootId == null) {
+    items = flameAll.map(it => ({ ...it }));
+    span = flameTotal;
+  } else {
+    const root = flameAll[rootId];
+    const eps = 1e-6;
+    items = flameAll
+      .filter(it => it.lane >= root.lane && it.start >= root.start - eps && it.end <= root.end + eps)
+      .map(it => ({ ...it, start: it.start - root.start, end: it.end - root.start, lane: it.lane - root.lane }));
+    span = Math.max(root.end - root.start, 0.001);
+  }
+  flameView.setData(items, span, null, "");
+
+  const fl = $("flameLabel");
+  fl.textContent = `compiler time trace — ${flameTaskName} · click a frame to zoom into it ` +
+    `(blue = includes, aqua = frontend, yellow = backend)`;
+  if (rootId != null) {
+    const root = flameAll[rootId];
+    const b = document.createElement("b");
+    b.textContent = ` · framed on ${flameView.opts.label(root)} (${fmtMs(root.end - root.start, true)})`;
+    const btn = document.createElement("button");
+    btn.className = "btn btn-mini";
+    btn.textContent = "⟲ show all";
+    btn.addEventListener("click", () => setFlameFrame(null));
+    fl.append(b, btn);
+  }
+}
+
+function renderFlame(events, taskName) {
+  // keep the main thread: the one carrying ExecuteCompiler (or busiest)
+  const byTid = new Map();
+  for (const e of events) byTid.set(e.tid, (byTid.get(e.tid) || 0) + (e.dur || 0));
+  const rootEv = events.find(e => e.name === "ExecuteCompiler" || e.name === "Total ExecuteCompiler");
+  const mainTid = rootEv ? rootEv.tid : [...byTid.entries()].sort((a, b) => b[1] - a[1])[0][0];
+  const evs = events
+    .filter(e => e.tid === mainTid && !String(e.name).startsWith("Total"))
+    .sort((a, b) => a.ts - b.ts || b.dur - a.dur);
+  if (!evs.length) return;
+
+  const ts0 = evs[0].ts;
+  const stack = [];
+  const items = evs.map((e, i) => {
+    while (stack.length && stack[stack.length - 1] <= e.ts) stack.pop();
+    const lane = stack.length;
+    stack.push(e.ts + e.dur);
+    return { id: i, start: (e.ts - ts0) / 1000, end: (e.ts + e.dur - ts0) / 1000, lane, ev: e };
+  });
+  flameAll = items;
+  flameTotal = Math.max(...items.map(i => i.end), 1);
+  flameTaskName = taskName;
+
+  if (!flameView) {
+    flameView = new TimelineView($("flameTimeline"), {
+      prePacked: true, util: false,
+      info: it => ({ kind: flameKind(it.ev.name), cp: false }),
+      label: it => {
+        const d = (it.ev.args || {}).detail;
+        if (!d) return it.ev.name;
+        return it.ev.name === "Source" ? d.split(/[\\/]/).pop() : d;
+      },
+      tip: it => {
+        const d = (it.ev.args || {}).detail || "";
+        return `<div class="tname">${esc(it.ev.name)}</div>` +
+          (d ? `<div class="trow">${esc(d)}</div>` : "") +
+          `<div class="trow">${fmtMs(it.end - it.start, true)} · ${(100 * (it.end - it.start) / flameTotal).toFixed(1)}% of compile</div>` +
+          `<div class="trow">click to zoom into this frame</div>`;
+      },
+      // click a frame → reframe on it; click the framed root again → back to all
+      onSelect: it => setFlameFrame(it.id === flameRootId ? null : it.id),
+    });
+    applyDetailMax(); // pick up lane sizing if already maximized
+  }
+  $("flameArea").style.display = "";
+  setFlameFrame(null);
+
+  // summary tables: phase totals + most expensive entries
+  const phases = events.filter(e => String(e.name).startsWith("Total") && e.name !== "Total ExecuteCompiler")
+    .sort((a, b) => b.dur - a.dur).slice(0, 8);
+  const interesting = evs
+    .filter(e => ["Source", "InstantiateClass", "InstantiateFunction", "OptFunction", "CodeGen Function", "ParseClass"].includes(e.name))
+    .sort((a, b) => b.dur - a.dur).slice(0, 10);
+  const row = (name, detail, us) =>
+    `<tr><td><span class="trunc" title="${esc(detail)}">${esc(name)}</span></td>` +
+    `<td class="num">${fmtMs(us / 1000, true)}</td></tr>`;
+  $("flameSummary").innerHTML =
+    `<table><thead><tr><th>compile phase</th><th class="num">time</th></tr></thead><tbody>` +
+    phases.map(p => row(p.name.replace(/^Total /, ""), p.name, p.dur)).join("") + "</tbody></table>" +
+    `<table><thead><tr><th>most expensive entries</th><th class="num">time</th></tr></thead><tbody>` +
+    interesting.map(e => row(((e.args || {}).detail || e.name), e.name + " " + ((e.args || {}).detail || ""), e.dur)).join("") +
+    "</tbody></table>";
+}
+
+async function profileTask(id, btn) {
+  btn.disabled = true;
+  btn.textContent = "profiling…";
+  $("flameArea").style.display = "none";
+  try {
+    const res = await fetch("/api/profile-task", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: id }),
+    }).then(r => r.json());
+    if (res.error) {
+      $("detailActions").insertAdjacentHTML("beforeend", `<div class="profile-error">${esc(res.error)}</div>`);
+    } else {
+      renderFlame(res.events, T[id].name);
+    }
+  } catch (err) {
+    $("detailActions").insertAdjacentHTML("beforeend", `<div class="profile-error">${esc(String(err))}</div>`);
+  }
+  btn.disabled = false;
+  btn.textContent = "Profile with -ftime-trace";
+}
+
+// ------------------------------------------------ whole-build profile ---
+$("profileBuildBtn").addEventListener("click", async () => {
+  const btn = $("profileBuildBtn");
+  btn.disabled = true;
+  btn.textContent = "starting…";
+  try {
+    const { job } = await fetch("/api/profile-build", { method: "POST" }).then(r => r.json());
+    const poll = setInterval(async () => {
+      const st = await fetch("/api/job/" + job).then(r => r.json()).catch(() => null);
+      if (!st) return;
+      if (st.state === "running") {
+        btn.textContent = `profiling ${st.done}/${st.total} TUs…`;
+      } else {
+        clearInterval(poll);
+        btn.disabled = false;
+        btn.textContent = "profile whole build";
+        if (st.state === "error") alert("profiling failed: " + st.error);
+        else renderBuildProfile(st.result);
+      }
+    }, 700);
+  } catch (err) {
+    btn.disabled = false;
+    btn.textContent = "profile whole build";
+    alert("profiling failed: " + err);
+  }
+});
+
+function renderBuildProfile(r) {
+  $("buildProfileSection").style.display = "";
+  $("bpStats").innerHTML = [
+    [String(r.tusProfiled), "TUs profiled" + (r.failed ? ` (${r.failed} failed)` : "")],
+    [fmtMs(r.frontendMs), "frontend time (parse + sema + templates)"],
+    [fmtMs(r.backendMs), "backend time (codegen + opt)"],
+  ].map(([v, l]) => `<div><b>${v}</b>${l}</div>`).join("");
+
+  const nameRow = (name, ms, count) =>
+    `<tr><td><span class="trunc" title="${esc(name)}">${esc(name)}</span></td>` +
+    `<td class="num">${fmtMs(ms)}</td><td class="num">${count}×</td></tr>`;
+  const head = `<thead><tr><th>name</th><th class="num">total</th><th class="num">count</th></tr></thead>`;
+  $("bpHeaders").innerHTML = head + "<tbody>" + r.topHeaders.map(h => nameRow(h.name, h.ms, h.count)).join("") + "</tbody>";
+  $("bpTemplates").innerHTML = head + "<tbody>" + r.topTemplates.map(h => nameRow(h.name, h.ms, h.count)).join("") + "</tbody>";
+  $("bpFunctions").innerHTML = head + "<tbody>" + r.topFunctions.map(h => nameRow(h.name, h.ms, h.count)).join("") + "</tbody>";
+  $("bpTus").innerHTML =
+    `<thead><tr><th>translation unit</th><th class="num">total</th><th class="num">frontend</th><th class="num">backend</th></tr></thead><tbody>` +
+    r.slowestTus.map(u =>
+      `<tr data-id="${u.task}"><td><span class="trunc" title="${esc(T[u.task].name)}">${esc(T[u.task].name)}</span></td>` +
+      `<td class="num">${fmtMs(u.ms)}</td><td class="num">${fmtMs(u.frontendMs)}</td><td class="num">${fmtMs(u.backendMs)}</td></tr>`).join("") +
+    "</tbody>";
+  $("bpTus").addEventListener("click", e => {
+    const rowEl = e.target.closest("tr[data-id]");
+    if (rowEl) { const id = +rowEl.dataset.id; actualView.focusTask(id); showDetail(id); }
+  });
+  $("buildProfileSection").scrollIntoView({ behavior: "smooth", block: "start" });
+}
 
 // ---------------------------------------------------------- speedup curve ---
 let chart = null;
@@ -720,7 +1151,7 @@ $("cpTable").innerHTML =
     `${(100 * t.dur / Math.max(M.cpLength, 1)).toFixed(1)}%</td></tr>`).join("") + "</tbody>";
 $("cpTable").addEventListener("click", e => {
   const row = e.target.closest("tr[data-id]");
-  if (row) actualView.focusTask(+row.dataset.id);
+  if (row) { actualView.focusTask(+row.dataset.id); showDetail(+row.dataset.id); }
 });
 
 // -------------------------------------------------------------- theme etc ---
@@ -731,6 +1162,8 @@ function repaintAll() {
   paintSwatches();
   actualView.render();
   simView.render();
+  if (flameView) flameView.render();
+  if (selectedTask != null) $("detailKindSw").style.background = kindColor(T[selectedTask].kind);
   renderSpeedupChart();
 }
 themeBtn.addEventListener("click", () => {
@@ -750,6 +1183,7 @@ new ResizeObserver(() => {
   if (w > 0 && w !== lastW) {
     lastW = w;
     actualView.resize(); simView.resize();
+    if (flameView) flameView.resize();
     if (chart) chart.resize(); else renderSpeedupChart();
   }
 }).observe(document.querySelector(".wrap"));

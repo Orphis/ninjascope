@@ -35,6 +35,32 @@ Works on any Ninja build directory (CMake, GN, Meson, …), not just the sample.
 
 Options: `-o out.html`, `--title "…"`, `--no-deps` (skip `ninja -t deps`).
 
+## Interactive mode: compiler profiling
+
+```sh
+python ninjaviz.py sample/build --interactive     # opens http://127.0.0.1:8017/
+```
+
+Serves the *same* report from a live Python process — the page feature-detects
+the bridge (`fetch /api/ping`) and lights up profiling on top of the static
+views (options: `--port`, `--no-open`):
+
+- **Click any task** → detail panel (duration, slack, deps, rule). For clang
+  compile and lld link steps a **"Profile with -ftime-trace"** button re-runs
+  that exact command (from `ninja -t commands`, with `-o` redirected to a temp
+  dir so the build tree is untouched) and renders the Chrome-trace output as an
+  in-page **flame chart** — the Gantt renderer reused with rows = stack depth —
+  plus phase totals and the most expensive includes/instantiations of that TU.
+- **"Profile whole build"** (header button) re-compiles every clang TU with
+  `-ftime-trace` in parallel and aggregates a mini ClangBuildAnalyzer report:
+  slowest TUs (click through to the timeline), most expensive headers,
+  template instantiations, and functions — connecting the DAG-level story
+  ("this task is on the critical path") to the code-level story ("…because of
+  this header/template").
+
+Opened as a plain file (or served without the bridge), the same HTML stays
+fully static — the profiling UI simply never appears.
+
 ## What the report shows
 
 - **Actual build timeline** — Gantt of every task from `.ninja_log`, one row
