@@ -10,6 +10,14 @@ The project is shaped to make build-parallelism visualization interesting:
   - a "core" library with a few slow translation units on the critical path,
   - a final executable linking everything (serialized tail).
 
+The same source tree configures into two flavors of the same graph:
+  - precise (default): every codegen rule lives in the top-level
+    CMakeLists.txt, so CMake wires exact file-level deps between codegen steps;
+  - coarse (-DCOARSE_DEPS=ON): codegen is declared in each library's own
+    subdirectory, the way projects naturally grow. Cross-directory file-level
+    deps degrade to whole-target dependencies, so each codegen step waits for
+    its dependencies' *archives* — the serialization NinjaScope helps find.
+
 Usage:
   python generate_sample.py [--libs 25] [--files-per-lib 8] [--depth 6]
                             [--seed 42] [--out sample]
@@ -98,17 +106,24 @@ def main() -> None:
         picks.discard(i)
         deps[i] = [0] + sorted(picks)
 
-    # ---- single top-level CMakeLists ----
-    # All custom commands live in one directory: CMake then wires precise
-    # file-level dependencies between codegen steps (like protobuf imports).
-    # Declared in subdirectories, CMake would coarsen cross-directory file
-    # deps into whole-target deps (codegen waiting on dependency archives),
-    # which serializes far more than intended.
+    # ---- top-level CMakeLists: two layouts for the same graph ----
+    # precise (default): all custom commands live in this one directory, so
+    # CMake wires exact file-level dependencies between codegen steps (like
+    # protobuf imports).
+    # coarse (-DCOARSE_DEPS=ON): each library declares its codegen in its own
+    # subdirectory. CMake coarsens cross-directory file deps into whole-target
+    # deps (codegen waiting on dependency archives), which serializes each
+    # layer behind the previous layer's archive — the pathology this tool is
+    # built to expose.
     top = [
         "cmake_minimum_required(VERSION 3.20)",
         "project(NinjaScopeSample CXX)",
         "set(CMAKE_CXX_STANDARD 17)",
         "set(CMAKE_CXX_STANDARD_REQUIRED ON)",
+        "",
+        "# ON: declare codegen per-library subdirectory (whole-target deps,",
+        "# over-serialized). OFF: all codegen here with file-level deps.",
+        'option(COARSE_DEPS "coarse per-subdirectory codegen dependencies" OFF)',
         "",
         "# Slow global codegen step: serialized head of the build.",
         "add_custom_command(",
@@ -120,6 +135,7 @@ def main() -> None:
         "include_directories(${CMAKE_SOURCE_DIR}/include ${CMAKE_BINARY_DIR}/generated)",
         "",
     ]
+    precise: list[str] = []  # per-lib rules for the default (precise) layout
 
     # ---- per-library sources + build rules ----
     for i in range(args.libs):
@@ -160,8 +176,11 @@ def main() -> None:
         ]
         if i == 0:
             dep_gens = ["${CMAKE_BINARY_DIR}/generated/gen_config.h"]
+        link_libs = " ".join(lib_name(j) for j in deps[i])
         sleep = round(rng.uniform(0.1, 0.35), 2)
-        top += [
+
+        # precise layout: rule lives in the top-level file, file-level DEPENDS.
+        precise += [
             "add_custom_command(",
             f"  OUTPUT {gen_out}",
             f"  COMMAND ${{CMAKE_COMMAND}} -E sleep {sleep}",
@@ -179,10 +198,44 @@ def main() -> None:
             f"target_include_directories({name} PUBLIC ${{CMAKE_SOURCE_DIR}}/libs/{name} ${{CMAKE_BINARY_DIR}}/generated/{name})",
         ]
         if deps[i]:
-            top.append(
-                f"target_link_libraries({name} PUBLIC " + " ".join(lib_name(j) for j in deps[i]) + ")"
-            )
-        top.append("")
+            precise.append(f"target_link_libraries({name} PUBLIC {link_libs})")
+        precise.append("")
+
+        # coarse layout: the same codegen declared in the library's own
+        # directory, the way projects naturally grow. A file-level DEPENDS on
+        # another directory's custom-command output can't be expressed here,
+        # so the generated header is anchored as a library source and ordering
+        # comes from target-level deps: this codegen (and every compile of the
+        # library) waits for its dependencies' whole targets — archives
+        # included — instead of just their codegen outputs.
+        sub = [
+            "add_custom_command(",
+            f"  OUTPUT {gen_out}",
+            f"  COMMAND ${{CMAKE_COMMAND}} -E sleep {sleep}",
+            f"  COMMAND ${{CMAKE_COMMAND}} -E copy ${{CMAKE_CURRENT_SOURCE_DIR}}/{name}_gen.h.in {gen_out}",
+            f"  DEPENDS ${{CMAKE_CURRENT_SOURCE_DIR}}/{name}_gen.h.in",
+            f'  COMMENT "codegen: {name} interface")',
+            f"add_library({name} STATIC",
+            f"  {gen_out}",
+            *(f"  {fn}.cpp" for fn in fn_names),
+            ")",
+            f"target_include_directories({name} PUBLIC ${{CMAKE_CURRENT_SOURCE_DIR}} ${{CMAKE_BINARY_DIR}}/generated/{name})",
+        ]
+        if i == 0:
+            sub.append("add_dependencies(core gen_config)")
+        if deps[i]:
+            sub.append(f"target_link_libraries({name} PUBLIC {link_libs})")
+        sub.append("")
+        (d / "CMakeLists.txt").write_text("\n".join(sub))
+
+    top += ["if(COARSE_DEPS)"]
+    top += [
+        "  add_custom_target(gen_config DEPENDS ${CMAKE_BINARY_DIR}/generated/gen_config.h)",
+    ]
+    top += [f"  add_subdirectory(libs/{lib_name(i)})" for i in range(args.libs)]
+    top += ["else()"]
+    top += [("  " + line if line else "") for line in precise]
+    top += ["endif()", ""]
 
     top += [
         "add_executable(app main.cpp)",
@@ -202,6 +255,8 @@ def main() -> None:
     n_tasks = args.libs * (args.files_per_lib + 2) + 2
     print(f"Generated {out}/ with {args.libs} libs x {args.files_per_lib} files "
           f"in {args.depth} layers (~{n_tasks} build tasks)")
+    print("Configure with -DCOARSE_DEPS=ON for the over-serialized flavor "
+          "(codegen declared per subdirectory, whole-target deps)")
 
 
 if __name__ == "__main__":

@@ -30,6 +30,26 @@ ninja -C sample/build
 python ninjascope.py sample/build -o report.html --title "My build"
 ```
 
+### Before/after: the over-serialized flavor
+
+The same sources also configure into a deliberately *unoptimized* build graph —
+the kind of serialization this tool exists to find:
+
+```sh
+cmake -S sample -B sample/build-coarse -G Ninja -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=Release -DCOARSE_DEPS=ON
+ninja -C sample/build-coarse
+python ninjascope.py sample/build-coarse -o report-coarse.html --title "Coarse deps"
+```
+
+Open the two reports side by side: same tasks, same durations, but in the
+coarse flavor each library's codegen waits on its dependencies' *archives*
+instead of just their generated headers, so every layer serializes behind the
+previous one and the critical path balloons.
+
+(Don't compare *total work* between the two reports: the precise build keeps
+the machine saturated, so contention inflates its measured task durations —
+compare the critical paths and the speedup curves instead.)
+
 Works on any Ninja build directory (CMake, GN, Meson, …), not just the sample.
 `uv run ninjascope.py …` also works (PEP 723 metadata, stdlib-only).
 
@@ -95,12 +115,21 @@ should be within a few percent of the measured wall time.
 
 Knobs: `--libs 25 --files-per-lib 8 --depth 6 --seed 42 --out sample`.
 
-Gotcha worth knowing (it bit this project): custom commands whose file-level
-`DEPENDS` cross CMake directories get coarsened into whole-target
-dependencies, which serializes each layer behind the previous layer's
-*archive*. The generator therefore emits all codegen rules in one
-CMakeLists.txt and anchors each generated header with its own
-`add_custom_target` instead of listing it as a library source.
+The project configures into two flavors of the same graph, switched by
+`-DCOARSE_DEPS` (see above):
+
+- **precise** (default, the optimized "after"): all codegen rules live in the
+  top-level CMakeLists.txt, so CMake wires exact file-level `DEPENDS` between
+  codegen steps; each generated header is anchored with its own
+  `add_custom_target` instead of being listed as a library source.
+- **coarse** (`-DCOARSE_DEPS=ON`, the "before"): codegen is declared in each
+  library's own subdirectory, the way projects naturally grow. File-level
+  `DEPENDS` on custom-command outputs can't cross CMake directories, so the
+  generated header is anchored as a library source and ordering falls back to
+  whole-target dependencies — each codegen step (and every compile behind it)
+  waits for its dependencies' *archives*, serializing each layer behind the
+  previous one. This gotcha bit this very project, and it's exactly the kind
+  of structure the reports make visible.
 
 ## Accuracy notes
 
