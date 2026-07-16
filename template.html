@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>NinjaViz build report</title>
+<title>NinjaScope build report</title>
 <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js"></script>
 <style>
   :root {
@@ -801,7 +801,7 @@ $("cpToggle").addEventListener("change", e => {
 runSim();
 
 // ------------------------------------------- bridge (interactive mode) ---
-// The same page is served either as a static file or by `ninjaviz.py
+// The same page is served either as a static file or by `ninjascope.py
 // --interactive`. Feature-detect the live Python process; only then show
 // the profiling UI. On file:// the fetch throws and we stay static.
 let BRIDGE = null;
@@ -850,7 +850,7 @@ function showDetail(id) {
   } else if (BRIDGE) {
     act.innerHTML = `<span>profiling is available for clang compile and lld link steps</span>`;
   } else {
-    act.innerHTML = `<span>run <code>ninjaviz.py ${esc(M.builddir)} --interactive</code> to enable compiler profiling</span>`;
+    act.innerHTML = `<span>run <code>ninjascope.py ${esc(M.builddir)} --interactive</code> to enable compiler profiling</span>`;
   }
 }
 $("detailClose").addEventListener("click", () => {
@@ -1080,6 +1080,11 @@ function renderSpeedupChart() {
   chart = echarts.init(el, null, { renderer: "canvas" });
   const finite = M.speedup.filter(p => p.cores != null);
   const ink = cssVar("--text-secondary"), muted = cssVar("--text-muted"), grid = cssVar("--grid");
+  // The perfect-scaling line dives far below the critical-path floor at high
+  // core counts; unbounded, it drags the log axis down and squishes the
+  // useful band. Pin the range to [just below CP, just above total work] and
+  // end the ideal line where it hits the floor.
+  const yMin = M.cpLength / 1.35, yMax = M.work * 1.2;
   chart.setOption({
     animation: false,
     backgroundColor: "transparent",
@@ -1099,7 +1104,9 @@ function renderSpeedupChart() {
     },
     yAxis: {
       type: "log", name: "predicted wall time", nameTextStyle: { color: muted, align: "left" },
-      axisLabel: { color: muted, formatter: v => fmtMs(v) },
+      min: yMin, max: yMax,
+      // the exact bounds are arbitrary (cp/1.35, work*1.2) — don't label them
+      axisLabel: { color: muted, formatter: v => fmtMs(v), showMinLabel: false, showMaxLabel: false },
       splitLine: { lineStyle: { color: grid } },
     },
     series: [
@@ -1111,7 +1118,7 @@ function renderSpeedupChart() {
       },
       {
         name: "perfect scaling (work ÷ cores)", type: "line", symbol: "none",
-        data: finite.map(p => [p.cores, M.work / p.cores]),
+        data: finite.map(p => [p.cores, M.work / p.cores >= yMin ? M.work / p.cores : null]),
         lineStyle: { width: 1.5, type: "dashed", color: muted },
         itemStyle: { color: muted },
       },

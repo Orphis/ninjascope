@@ -1,4 +1,4 @@
-# NinjaViz
+# NinjaScope
 
 Visualize the parallelism of a Ninja build: what actually ran, how well the
 cores were used, what would happen with more cores (up to remote-execution
@@ -27,18 +27,18 @@ cmake -S sample -B sample/build -G Ninja -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BU
 ninja -C sample/build
 
 # 3. generate the report
-python ninjaviz.py sample/build -o report.html --title "My build"
+python ninjascope.py sample/build -o report.html --title "My build"
 ```
 
 Works on any Ninja build directory (CMake, GN, Meson, …), not just the sample.
-`uv run ninjaviz.py …` also works (PEP 723 metadata, stdlib-only).
+`uv run ninjascope.py …` also works (PEP 723 metadata, stdlib-only).
 
 Options: `-o out.html`, `--title "…"`, `--no-deps` (skip `ninja -t deps`).
 
 ## Interactive mode: compiler profiling
 
 ```sh
-python ninjaviz.py sample/build --interactive     # opens http://127.0.0.1:8017/
+python ninjascope.py sample/build --interactive     # opens http://127.0.0.1:8017/
 ```
 
 Serves the *same* report from a live Python process — the page feature-detects

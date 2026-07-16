@@ -1,7 +1,7 @@
 # /// script
 # requires-python = ">=3.10"
 # ///
-"""NinjaViz — visualize build parallelism of a Ninja build directory.
+"""NinjaScope — visualize build parallelism of a Ninja build directory.
 
 Reads build.ninja (dependency graph), .ninja_log (task timings) and the
 discovered dependencies (ninja -t deps, for generated headers), then writes a
@@ -11,8 +11,8 @@ self-contained HTML report with:
   - the critical path, highlighted and with stats.
 
 Usage:
-  python ninjaviz.py <build-dir> [-o report.html] [--title "My build"] [--no-deps]
-  python ninjaviz.py <build-dir> --interactive [--port 8017] [--no-open]
+  python ninjascope.py <build-dir> [-o report.html] [--title "My build"] [--no-deps]
+  python ninjascope.py <build-dir> --interactive [--port 8017] [--no-open]
 
 Interactive mode serves the same report from a local Python process and adds
 compiler profiling: re-run any clang compile (or lld link) with -ftime-trace
@@ -621,7 +621,7 @@ def profile_command(builddir: Path, cmd: str, kind: str) -> dict:
     m = _O_TOKEN.search(cmd)
     if not m:
         return {"error": "could not find -o <output> in the command line"}
-    tmp = Path(tempfile.mkdtemp(prefix="ninjaviz_prof_"))
+    tmp = Path(tempfile.mkdtemp(prefix="ninjascope_prof_"))
     try:
         trace = tmp / "trace.json"
         out_ext = Path(m.group(1).strip('"')).suffix or ".out"
