@@ -58,7 +58,7 @@ Options: `-o out.html`, `--title "…"`, `--no-deps` (skip `ninja -t deps`).
 ## Interactive mode: compiler profiling
 
 ```sh
-python ninjascope.py sample/build --interactive     # opens http://127.0.0.1:8017/
+python ninjascope.py sample/build --interactive     # serves on a random free port and opens it
 ```
 
 Serves the *same* report from a live Python process — the page feature-detects

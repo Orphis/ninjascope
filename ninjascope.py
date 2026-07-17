@@ -12,7 +12,7 @@ self-contained HTML report with:
 
 Usage:
   python ninjascope.py <build-dir> [-o report.html] [--title "My build"] [--no-deps]
-  python ninjascope.py <build-dir> --interactive [--port 8017] [--no-open]
+  python ninjascope.py <build-dir> --interactive [--port N] [--no-open]
 
 Interactive mode serves the same report from a local Python process and adds
 compiler profiling: re-run any clang compile (or lld link) with -ftime-trace
@@ -882,9 +882,19 @@ def serve(bridge: Bridge, port: int, open_browser: bool) -> None:
         def log_message(self, *a):  # quiet
             pass
 
-    httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    class Server(ThreadingHTTPServer):
+        # No SO_REUSEADDR: binding an in-use port must fail loudly. With it
+        # set (the http.server default), a second instance silently shares
+        # the port on Windows and requests go to whichever instance wins.
+        allow_reuse_address = False
+
+    try:
+        httpd = Server(("127.0.0.1", port or 0), Handler)
+    except OSError:
+        sys.exit(f"error: port {port} is already in use (another instance?) — "
+                 "pass a different --port, or omit it for a random free port")
     url = f"http://127.0.0.1:{httpd.server_address[1]}/"
-    print(f"interactive mode: serving report at {url}  (Ctrl+C to stop)")
+    print(f"interactive mode: serving report at {url}  (Ctrl+C to stop)", flush=True)
     if open_browser:
         webbrowser.open(url)
     try:
@@ -904,7 +914,8 @@ def main() -> None:
     ap.add_argument("--interactive", action="store_true",
                     help="serve the report from a live process with compiler "
                          "profiling (clang -ftime-trace) instead of writing a file")
-    ap.add_argument("--port", type=int, default=8017, help="interactive mode port")
+    ap.add_argument("--port", type=int, default=None,
+                    help="interactive mode port (default: a random free port)")
     ap.add_argument("--no-open", action="store_true",
                     help="interactive mode: don't open the browser automatically")
     args = ap.parse_args()
