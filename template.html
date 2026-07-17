@@ -232,7 +232,7 @@
 
   <section id="detailSection" style="display:none">
     <h2>Task detail</h2>
-    <p class="sub">Selected from the timeline — click any bar above to inspect a task.</p>
+    <p class="sub">Selected from the timeline — click any bar above to inspect a task, click it again to deselect. The longest dependency chain leading to it is outlined in the timelines; everything else dims.</p>
     <div class="panel">
       <div class="detail-head">
         <span class="chip"><span class="sw" id="detailKindSw"></span><span id="detailKind"></span></span>
@@ -284,7 +284,7 @@
 <div class="tooltip" id="tooltip"></div>
 
 <script>
-const DATA = /*__NINJAVIZ_DATA__*/null;
+const DATA = /*__NINJASCOPE_DATA__*/null;
 
 // ---------------------------------------------------------------- helpers ---
 const $ = id => document.getElementById(id);
@@ -358,6 +358,22 @@ for (let k = N - 1; k >= 0; k--) {
   let best = 0;
   for (const s of succs[i]) if (tails[s] > best) best = tails[s];
   tails[i] = T[i].dur + best;
+}
+
+// upstream critical-path length: the longest dependency chain ending at each
+// task, with the predecessor realizing it (for path reconstruction)
+const heads = new Float64Array(N);
+const bestPred = new Int32Array(N).fill(-1);
+for (const i of topo) {
+  let best = 0, bp = -1;
+  for (const d of T[i].deps) if (heads[d] > best) { best = heads[d]; bp = d; }
+  heads[i] = T[i].dur + best;
+  bestPred[i] = bp;
+}
+function pathTo(id) { // task ids on the critical path leading to `id`
+  const ids = [];
+  for (let i = id; i >= 0; i = bestPred[i]) ids.push(i);
+  return ids;
 }
 
 // ------------------------------------------------------------- scheduling ---
@@ -467,6 +483,7 @@ class TimelineView {
     container.append(this.gantt, this.utilLabel, this.util, this.note);
     if (opts.util === false) { this.util.style.display = "none"; this.utilLabel.style.display = "none"; }
     this.highlightCp = false;
+    this.pathIds = null; // Set of task ids: critical path to the selected task
     this.flash = null;
     this.hoverId = null;
     this.items = [];
@@ -566,7 +583,8 @@ class TimelineView {
         if (x0 > this.w) break;
         const wpx = Math.max(x1 - x0, 1);
         const t = this._info(it);
-        const dim = this.highlightCp && !t.cp;
+        const inPath = this.pathIds !== null && this.pathIds.has(it.id);
+        const dim = (this.highlightCp && !t.cp) || (this.pathIds !== null && !inPath);
         const hovered = this.hoverId === it.id;
         g.globalAlpha = dim && !hovered ? 0.22 : 1;
         g.fillStyle = colors[t.kind] || colors.other;
@@ -595,7 +613,7 @@ class TimelineView {
             g.restore();
           }
         }
-        if (this.highlightCp && t.cp && this.laneH > 4) {
+        if (((this.highlightCp && t.cp) || inPath) && this.laneH > 4) {
           g.globalAlpha = 1;
           g.strokeStyle = critical; g.lineWidth = 1.5;
           g.strokeRect(x0 + 0.75, y + 0.75, Math.max(wpx - 1.5, 0.5), this.laneH - gap - 1.5);
@@ -766,7 +784,7 @@ function paintSwatches() {
 }
 
 // actual timeline
-const actualView = new TimelineView($("actualTimeline"), { onSelect: it => showDetail(it.id) });
+const actualView = new TimelineView($("actualTimeline"), { onSelect: it => toggleDetail(it.id) });
 const actualItems = T.filter(t => t.start != null).map(t => ({ id: t.id, start: t.start, end: t.end }));
 const actualEnd = Math.max(...actualItems.map(i => i.end), 1);
 actualView.setData(actualItems, actualEnd, M.peakConcurrency, "CPU utilization — tasks running over time");
@@ -774,7 +792,7 @@ actualView.setData(actualItems, actualEnd, M.peakConcurrency, "CPU utilization �
 // simulation
 const CORE_STEPS = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768,
                     1024, 1536, 2048, 3072, 4096, 6144, 8192, Infinity];
-const simView = new TimelineView($("simTimeline"), { onSelect: it => showDetail(it.id) });
+const simView = new TimelineView($("simTimeline"), { onSelect: it => toggleDetail(it.id) });
 const slider = $("coreSlider");
 slider.max = CORE_STEPS.length - 1;
 slider.value = Math.max(CORE_STEPS.findIndex(c => c >= (M.peakConcurrency || 8)), 0);
@@ -817,8 +835,29 @@ fetch("/api/ping").then(r => (r.ok ? r.json() : null)).then(info => {
 let selectedTask = null;
 let flameView = null;
 
+// highlight the critical path leading to `id` in both gantt views
+function setPathHighlight(id) {
+  const ids = id == null ? null : new Set(pathTo(id));
+  actualView.pathIds = simView.pathIds = ids;
+  actualView.render(); simView.render();
+}
+
+function closeDetail() {
+  $("detailSection").style.display = "none";
+  setDetailMax(false);
+  selectedTask = null;
+  setPathHighlight(null);
+}
+
+// timeline clicks toggle: clicking the selected task again deselects it
+function toggleDetail(id) {
+  if (selectedTask === id) closeDetail();
+  else showDetail(id);
+}
+
 function showDetail(id) {
   selectedTask = id;
+  setPathHighlight(id);
   const t = T[id];
   $("detailSection").style.display = "";
   $("detailKindSw").style.background = kindColor(t.kind);
@@ -830,6 +869,7 @@ function showDetail(id) {
     [t.start != null ? fmtMs(t.start) + " → " + fmtMs(t.end) : "not built", "actual run"],
     [fmtMs(t.slack), "slack"],
     [t.cp ? "yes" : "no", "critical path"],
+    [fmtMs(heads[id]), "critical path to here"],
     [String(t.deps.length), "direct deps"],
     [String(dependents), "dependents"],
     [esc(t.ruleName), "ninja rule"],
@@ -853,11 +893,7 @@ function showDetail(id) {
     act.innerHTML = `<span>run <code>ninjascope.py ${esc(M.builddir)} --interactive</code> to enable compiler profiling</span>`;
   }
 }
-$("detailClose").addEventListener("click", () => {
-  $("detailSection").style.display = "none";
-  setDetailMax(false);
-  selectedTask = null;
-});
+$("detailClose").addEventListener("click", closeDetail);
 
 // maximize: full-viewport overlay; flame lanes switch to a fixed readable
 // height and the depth cap is lifted so the whole stack is visible

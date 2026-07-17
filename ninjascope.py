@@ -584,7 +584,7 @@ def build_report(builddir: Path, title: str | None, no_deps: bool):
 def render_html(data: dict) -> str:
     template = (Path(__file__).parent / "template.html").read_text(encoding="utf-8")
     payload = json.dumps(data, separators=(",", ":")).replace("</", "<\\/")
-    return template.replace("/*__NINJAVIZ_DATA__*/null", payload)
+    return template.replace("/*__NINJASCOPE_DATA__*/null", payload)
 
 
 # --------------------------------------------------------------------------
