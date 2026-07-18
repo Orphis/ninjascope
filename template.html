@@ -92,7 +92,18 @@
   .tile .l { color: var(--text-muted); font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.05em; margin-top: 2px; }
   .tile .s { color: var(--text-secondary); font-size: 12px; margin-top: 2px; }
 
+  .tabbar { display: flex; gap: 2px; margin: 18px 0 0; border-bottom: 1px solid var(--border); }
+  .tab {
+    padding: 8px 16px; font-size: 13px; color: var(--text-secondary); cursor: pointer;
+    border: 1px solid transparent; border-bottom: none; border-radius: 9px 9px 0 0;
+    position: relative; top: 1px; user-select: none;
+  }
+  .tab.active { background: var(--surface-1); border-color: var(--border); color: var(--text-primary); font-weight: 600; }
+  .view { display: none; }
+  .view.active { display: block; }
+
   section { margin-top: 34px; }
+  .view > section:first-child { margin-top: 22px; }
   h2 { font-size: 15px; font-weight: 650; margin: 0 0 4px; }
   .sub { color: var(--text-muted); font-size: 12.5px; margin: 0 0 12px; }
 
@@ -206,79 +217,94 @@
     recent entry per output. For accurate results, run a clean full build.
   </div>
 
-  <div class="tiles" id="tiles"></div>
+  <div class="tabbar">
+    <div class="tab active" data-view="overview">Overview</div>
+    <div class="tab" data-view="timeline">Timeline</div>
+    <div class="tab" data-view="profile">Profiling</div>
+  </div>
 
-  <section>
-    <h2>Actual build timeline</h2>
-    <p class="sub">Each row is a lane of work observed running in parallel (from <code>.ninja_log</code> timestamps).</p>
-    <div class="toolbar" id="legend"></div>
-    <div class="panel timeline" id="actualTimeline"></div>
-  </section>
+  <div class="view active" id="view-overview">
+    <div class="tiles" id="tiles"></div>
 
-  <section>
-    <h2>What-if: change the core count</h2>
-    <p class="sub">Greedy critical-path-first scheduling of the real dependency DAG using measured durations — what this build would look like with a different number of cores (e.g. remote execution).</p>
-    <div class="simbar">
-      <div class="simcores"><div class="cl">simulated cores</div><div class="cv" id="simCoresLabel"></div></div>
-      <input type="range" id="coreSlider" min="0" max="0" step="1">
-      <div class="simstats">
-        <div><b id="simWall"></b>predicted wall time</div>
-        <div><b id="simSpeedup"></b>vs. actual build</div>
-        <div><b id="simUtil"></b>core utilization</div>
-      </div>
-    </div>
-    <div class="panel timeline" id="simTimeline"></div>
-  </section>
+    <section>
+      <h2>Speedup curve</h2>
+      <p class="sub">Predicted wall time vs. core count. The curve can never cross the critical path — past the knee, adding cores buys nothing.</p>
+      <div class="panel"><div id="speedupChart"></div><div class="fallback-table" id="speedupFallback" style="display:none"></div></div>
+    </section>
 
-  <section id="detailSection" style="display:none">
-    <h2>Task detail</h2>
-    <p class="sub">Selected from the timeline — click any bar above to inspect a task, click it again to deselect. The longest dependency chain leading to it is outlined in the timelines; everything else dims.</p>
-    <div class="panel">
-      <div class="detail-head">
-        <span class="chip"><span class="sw" id="detailKindSw"></span><span id="detailKind"></span></span>
-        <b id="detailName"></b>
-        <span class="spacer"></span>
-        <button id="detailMax" title="Maximize (Esc to restore)">⛶</button>
-        <button id="detailClose" title="Close">×</button>
-      </div>
-      <div class="detail-info" id="detailInfo"></div>
-      <div class="detail-actions" id="detailActions"></div>
-      <div id="flameArea" style="display:none">
-        <div class="util-label" id="flameLabel"></div>
-        <div id="flameBody">
-          <div class="timeline" id="flameTimeline"></div>
-          <div id="flameSummary"></div>
+    <section>
+      <h2>Critical path</h2>
+      <p class="sub">The longest dependency chain — the hard floor on build time at any core count. Click a row to locate the task in the timeline.</p>
+      <div class="cp-stats" id="cpStats"></div>
+      <div class="panel cp-table"><table id="cpTable"></table></div>
+    </section>
+  </div>
+
+  <div class="view" id="view-timeline">
+    <section>
+      <h2>Actual build timeline</h2>
+      <p class="sub">Each row is a lane of work observed running in parallel (from <code>.ninja_log</code> timestamps).</p>
+      <div class="toolbar" id="legend"></div>
+      <div class="panel timeline" id="actualTimeline"></div>
+    </section>
+
+    <section>
+      <h2>What-if: change the core count</h2>
+      <p class="sub">Greedy critical-path-first scheduling of the real dependency DAG using measured durations — what this build would look like with a different number of cores (e.g. remote execution).</p>
+      <div class="simbar">
+        <div class="simcores"><div class="cl">simulated cores</div><div class="cv" id="simCoresLabel"></div></div>
+        <input type="range" id="coreSlider" min="0" max="0" step="1">
+        <div class="simstats">
+          <div><b id="simWall"></b>predicted wall time</div>
+          <div><b id="simSpeedup"></b>vs. actual build</div>
+          <div><b id="simUtil"></b>core utilization</div>
         </div>
       </div>
-    </div>
-  </section>
+      <div class="panel timeline" id="simTimeline"></div>
+    </section>
 
-  <section>
-    <h2>Speedup curve</h2>
-    <p class="sub">Predicted wall time vs. core count. The curve can never cross the critical path — past the knee, adding cores buys nothing.</p>
-    <div class="panel"><div id="speedupChart"></div><div class="fallback-table" id="speedupFallback" style="display:none"></div></div>
-  </section>
+    <section id="detailSection" style="display:none">
+      <h2>Task detail</h2>
+      <p class="sub">Selected from the timeline — click any bar above to inspect a task, click it again to deselect. The longest dependency chain leading to it is outlined in the timelines; everything else dims.</p>
+      <div class="panel">
+        <div class="detail-head">
+          <span class="chip"><span class="sw" id="detailKindSw"></span><span id="detailKind"></span></span>
+          <b id="detailName"></b>
+          <span class="spacer"></span>
+          <button id="detailMax" title="Maximize (Esc to restore)">⛶</button>
+          <button id="detailClose" title="Close">×</button>
+        </div>
+        <div class="detail-info" id="detailInfo"></div>
+        <div class="detail-actions" id="detailActions"></div>
+        <div id="flameArea" style="display:none">
+          <div class="util-label" id="flameLabel"></div>
+          <div id="flameBody">
+            <div class="timeline" id="flameTimeline"></div>
+            <div id="flameSummary"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </div>
 
-  <section id="buildProfileSection" style="display:none">
-    <h2>Whole-build compiler profile</h2>
-    <p class="sub">Every clang translation unit re-compiled with <code>-ftime-trace</code> and aggregated —
-      the code-level "why" behind the slow tasks. Times are inclusive sums across all TUs
-      (nested entries overlap), like ClangBuildAnalyzer.</p>
-    <div class="cp-stats" id="bpStats"></div>
-    <div class="bp-grid">
-      <div class="panel cp-table"><h3>Slowest translation units</h3><table id="bpTus"></table></div>
-      <div class="panel cp-table"><h3>Most expensive headers (includes)</h3><table id="bpHeaders"></table></div>
-      <div class="panel cp-table"><h3>Most expensive template instantiations</h3><table id="bpTemplates"></table></div>
-      <div class="panel cp-table"><h3>Most expensive functions (codegen + opt)</h3><table id="bpFunctions"></table></div>
-    </div>
-  </section>
-
-  <section>
-    <h2>Critical path</h2>
-    <p class="sub">The longest dependency chain — the hard floor on build time at any core count. Click a row to locate the task in the timeline above.</p>
-    <div class="cp-stats" id="cpStats"></div>
-    <div class="panel cp-table"><table id="cpTable"></table></div>
-  </section>
+  <div class="view" id="view-profile">
+    <section>
+      <h2>Whole-build compiler profile</h2>
+      <p class="sub">Every clang translation unit re-compiled with <code>-ftime-trace</code> and aggregated —
+        the code-level "why" behind the slow tasks. Times are inclusive sums across all TUs
+        (nested entries overlap), like ClangBuildAnalyzer.</p>
+      <p class="sub" id="bpPlaceholder"></p>
+      <div id="buildProfileResults" style="display:none">
+        <div class="cp-stats" id="bpStats"></div>
+        <div class="bp-grid">
+          <div class="panel cp-table"><h3>Slowest translation units</h3><table id="bpTus"></table></div>
+          <div class="panel cp-table"><h3>Most expensive headers (includes)</h3><table id="bpHeaders"></table></div>
+          <div class="panel cp-table"><h3>Most expensive template instantiations</h3><table id="bpTemplates"></table></div>
+          <div class="panel cp-table"><h3>Most expensive functions (codegen + opt)</h3><table id="bpFunctions"></table></div>
+        </div>
+      </div>
+    </section>
+  </div>
 </div>
 
 <div class="tooltip" id="tooltip"></div>
@@ -818,15 +844,35 @@ $("cpToggle").addEventListener("change", e => {
 });
 runSim();
 
+// ------------------------------------------------------------------ tabs ---
+// Hidden views have zero width, so canvases and the chart are (re)laid out on
+// first activation of their tab.
+function go(view) {
+  document.querySelectorAll(".tab").forEach(t => t.classList.toggle("active", t.dataset.view === view));
+  document.querySelectorAll(".view").forEach(v => v.classList.toggle("active", v.id === "view-" + view));
+  // class toggles lay out synchronously, so the now-visible view can be sized here
+  if (view === "timeline") {
+    actualView.resize(); simView.resize();
+    if (flameView) flameView.resize();
+  } else if (view === "overview") {
+    if (chart) chart.resize(); else renderSpeedupChart();
+  }
+}
+document.querySelectorAll(".tab").forEach(t => t.addEventListener("click", () => go(t.dataset.view)));
+
 // ------------------------------------------- bridge (interactive mode) ---
 // The same page is served either as a static file or by `ninjascope.py
 // --interactive`. Feature-detect the live Python process; only then show
 // the profiling UI. On file:// the fetch throws and we stay static.
 let BRIDGE = null;
+$("bpPlaceholder").innerHTML =
+  `Not available in this static report — run <code>ninjascope.py ${esc(M.builddir)} --interactive</code> to enable it.`;
 fetch("/api/ping").then(r => (r.ok ? r.json() : null)).then(info => {
   if (info && info.ok) {
     BRIDGE = info;
     $("profileBuildBtn").style.display = "";
+    $("bpPlaceholder").innerHTML =
+      `No profile yet — press <b>profile whole build</b> in the header, or profile a single task from its detail panel.`;
     if (selectedTask != null) showDetail(selectedTask); // refresh actions row
   }
 }).catch(() => {});
@@ -1071,7 +1117,8 @@ $("profileBuildBtn").addEventListener("click", async () => {
 });
 
 function renderBuildProfile(r) {
-  $("buildProfileSection").style.display = "";
+  $("bpPlaceholder").style.display = "none";
+  $("buildProfileResults").style.display = "";
   $("bpStats").innerHTML = [
     [String(r.tusProfiled), "TUs profiled" + (r.failed ? ` (${r.failed} failed)` : "")],
     [fmtMs(r.frontendMs), "frontend time (parse + sema + templates)"],
@@ -1093,9 +1140,12 @@ function renderBuildProfile(r) {
     "</tbody>";
   $("bpTus").addEventListener("click", e => {
     const rowEl = e.target.closest("tr[data-id]");
-    if (rowEl) { const id = +rowEl.dataset.id; actualView.focusTask(id); showDetail(id); }
+    if (!rowEl) return;
+    const id = +rowEl.dataset.id;
+    go("timeline");
+    actualView.focusTask(id); showDetail(id);
   });
-  $("buildProfileSection").scrollIntoView({ behavior: "smooth", block: "start" });
+  go("profile");
 }
 
 // ---------------------------------------------------------- speedup curve ---
@@ -1194,7 +1244,10 @@ $("cpTable").innerHTML =
     `${(100 * t.dur / Math.max(M.cpLength, 1)).toFixed(1)}%</td></tr>`).join("") + "</tbody>";
 $("cpTable").addEventListener("click", e => {
   const row = e.target.closest("tr[data-id]");
-  if (row) { actualView.focusTask(+row.dataset.id); showDetail(+row.dataset.id); }
+  if (!row) return;
+  const id = +row.dataset.id;
+  go("timeline");
+  actualView.focusTask(id); showDetail(id);
 });
 
 // -------------------------------------------------------------- theme etc ---
