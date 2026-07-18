@@ -92,6 +92,29 @@
   .tile .l { color: var(--text-muted); font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.05em; margin-top: 2px; }
   .tile .s { color: var(--text-secondary); font-size: 12px; margin-top: 2px; }
 
+  .search { position: relative; }
+  .search input {
+    border: 1px solid var(--border); background: var(--surface-1); color: var(--text-primary);
+    border-radius: 8px; padding: 4px 10px; font: inherit; font-size: 12.5px; width: 260px;
+  }
+  .search input.active { border-color: var(--kind-compile); }
+  .search-results .sr-item.sr-all { display: block; color: var(--text-secondary); }
+  .search-results .sr-all b { color: var(--text-primary); }
+  .search-results .sr-stats { color: var(--text-muted); font-size: 11px; margin-top: 2px; }
+  .search-results .sr-sug .nm { color: var(--kind-compile); font-weight: 600; }
+  .search-results {
+    position: absolute; top: 30px; right: 0; z-index: 25; width: 360px; max-height: 320px;
+    overflow: auto; background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: 10px; box-shadow: 0 6px 24px rgba(0,0,0,0.25); font-size: 12.5px;
+  }
+  .search-results .sr-head { padding: 6px 10px; color: var(--text-muted); font-size: 11px; border-bottom: 1px solid var(--grid); }
+  .search-results .sr-foot { padding: 6px 10px; color: var(--text-muted); font-size: 10.5px; border-top: 1px solid var(--grid); line-height: 1.6; }
+  .search-results .sr-item { padding: 6px 10px; cursor: pointer; display: flex; gap: 8px; align-items: baseline; }
+  .search-results .sr-item:hover,
+  .search-results .sr-item.sel { background: color-mix(in srgb, var(--text-primary) 6%, transparent); }
+  .search-results .sr-item .nm { word-break: break-all; }
+  .search-results .sr-item .dur { margin-left: auto; color: var(--text-muted); white-space: nowrap; padding-left: 8px; }
+
   .tabbar { display: flex; gap: 2px; margin: 18px 0 0; border-bottom: 1px solid var(--border); }
   .tab {
     padding: 8px 16px; font-size: 13px; color: var(--text-secondary); cursor: pointer;
@@ -208,6 +231,12 @@
     <h1 id="title"></h1>
     <div class="meta" id="meta"></div>
     <div style="margin-left:auto; display:flex; gap:8px; align-items:center">
+      <div class="search">
+        <input id="searchBox" placeholder="search — e.g. type:compile dur:&gt;1s cpp  ( / )"
+               title="tokens are ANDed: name text (* wildcard) · type: rule: dur: slack: start: deps: dependents: is:cp is:built is:notbuilt · -token negates"
+               autocomplete="off" spellcheck="false">
+        <div class="search-results" id="searchResults" style="display:none"></div>
+      </div>
       <button class="btn" id="profileBuildBtn" style="display:none">profile whole build</button>
       <button id="themeToggle" title="Toggle color theme">theme: auto</button>
     </div>
@@ -509,7 +538,8 @@ class TimelineView {
     container.append(this.gantt, this.utilLabel, this.util, this.note);
     if (opts.util === false) { this.util.style.display = "none"; this.utilLabel.style.display = "none"; }
     this.highlightCp = false;
-    this.pathIds = null; // Set of task ids: critical path to the selected task
+    this.pathIds = null;   // Set of task ids: critical path to the selected task
+    this.filterIds = null; // Set of task ids matching the search query
     this.flash = null;
     this.hoverId = null;
     this.items = [];
@@ -610,7 +640,8 @@ class TimelineView {
         const wpx = Math.max(x1 - x0, 1);
         const t = this._info(it);
         const inPath = this.pathIds !== null && this.pathIds.has(it.id);
-        const dim = (this.highlightCp && !t.cp) || (this.pathIds !== null && !inPath);
+        const dim = (this.highlightCp && !t.cp) || (this.pathIds !== null && !inPath) ||
+                    (this.filterIds !== null && !this.filterIds.has(it.id));
         const hovered = this.hoverId === it.id;
         g.globalAlpha = dim && !hovered ? 0.22 : 1;
         g.fillStyle = colors[t.kind] || colors.other;
@@ -695,6 +726,14 @@ class TimelineView {
       if (x0 > px) break;
     }
     return null;
+  }
+
+  focusRange(t0, t1) {
+    const dur = Math.max(t1 - t0, this.span / 2000);
+    this.zoom = Math.min(Math.max(this.span / (dur * 1.15), 1), 2000);
+    this.panT = Math.max(0, t0 - dur * 0.05);
+    this.container.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    this.render();
   }
 
   focusTask(id) {
@@ -859,6 +898,283 @@ function go(view) {
   }
 }
 document.querySelectorAll(".tab").forEach(t => t.addEventListener("click", () => go(t.dataset.view)));
+
+// ---------------------------------------------------------------- search ---
+// Matching tasks stay lit in both gantt views (everything else dims, same
+// visual language as the path highlight); the dropdown lists the slowest
+// matches and jumps to one on click.
+//
+// Query language: whitespace-separated tokens, all ANDed.
+//   plain text      substring of the task name; `*` is a wildcard
+//   type:compile    task kind (prefix match; comma = OR, e.g. type:compile,link)
+//   rule:cxx        ninja rule name substring
+//   dur:>1s         duration; ops > >= < <= = (bare value means >=), units ms/s/m
+//   slack:<50ms     scheduling slack, same syntax
+//   start:>10s      when the task started, same syntax
+//   deps:>3         direct dependency count; dependents:>10 likewise
+//   is:cp           on the critical path · is:built / is:notbuilt
+//   -token          negates any token, e.g. -type:codegen
+//
+// The first dropdown row ("show all") is selected by default, so Enter frames
+// every match in the timeline; arrow down to jump to a single task instead.
+// Partial keys and enumerable values (type:, is:, rule:) get suggestion rows
+// above the results — Tab completes, or arrow up to one and press Enter.
+// Escape is two-stage: close the list but keep the filter, then clear.
+// The active query is mirrored into the URL hash (#q=…) so a link carries it.
+const searchBox = $("searchBox"), searchResults = $("searchResults");
+let searchTop = [], searchSel = 0, sugList = [], searchSpan = null;
+
+let hashTimer = null;
+function syncHash(raw) { // debounced: no history spam while typing
+  clearTimeout(hashTimer);
+  hashTimer = setTimeout(() => {
+    const q = raw.trim();
+    history.replaceState(null, "",
+      q.length >= 2 ? "#q=" + encodeURIComponent(q) : location.pathname + location.search);
+  }, 300);
+}
+
+// -------- filter autocompletion (keys, and values of enumerable keys) --------
+const FILTER_KEY_HINTS = [
+  ["type", "task kind"], ["rule", "ninja rule name"], ["dur", "duration, e.g. dur:>1s"],
+  ["slack", "e.g. slack:<50ms"], ["start", "start time"], ["end", "end time"],
+  ["deps", "direct dep count"], ["dependents", "dependent count"], ["is", "cp · built · notbuilt"],
+];
+const KIND_COUNTS = {}, RULE_COUNTS = new Map();
+T.forEach(t => {
+  KIND_COUNTS[t.kind] = (KIND_COUNTS[t.kind] || 0) + 1;
+  const r = t.ruleName.toLowerCase();
+  RULE_COUNTS.set(r, (RULE_COUNTS.get(r) || 0) + 1);
+});
+const RULE_NAMES = [...RULE_COUNTS.keys()].sort();
+const IS_COUNTS = {
+  cp: T.filter(t => t.cp).length,
+  built: T.filter(t => t.start != null).length,
+  notbuilt: T.filter(t => t.start == null).length,
+};
+
+// suggestions for the token under the caret; each carries the exact text range
+// [rs, re) it would replace, so completing never disturbs the rest of the query
+function computeSuggestions(raw, caret) {
+  const m = /\S+$/.exec(raw.slice(0, caret));
+  if (!m) return [];
+  const tokStart = m.index, token = m[0].toLowerCase();
+  const neg = token.startsWith("-");
+  const core = neg ? token.slice(1) : token;
+  const colon = core.indexOf(":");
+  const out = [];
+  if (colon === -1) {
+    if (core) for (const [k, hint] of FILTER_KEY_HINTS) {
+      if (k.startsWith(core))
+        out.push({ label: k + ":", hint, ins: (neg ? "-" : "") + k + ":", rs: tokStart, re: caret });
+    }
+  } else {
+    const key = core.slice(0, colon);
+    const valPart = core.slice(colon + 1);
+    const lastComma = valPart.lastIndexOf(",");
+    const prefix = valPart.slice(lastComma + 1);
+    const valStart = tokStart + (neg ? 1 : 0) + colon + 1 + lastComma + 1;
+    const pool =
+      (key === "type" || key === "kind") ? kindsPresent.map(k => [k, KIND_COUNTS[k] + " tasks"]) :
+      key === "is" ? Object.entries(IS_COUNTS).map(([k, n]) => [k, n + " tasks"]) :
+      key === "rule" ? RULE_NAMES.map(r => [r, RULE_COUNTS.get(r) + " tasks"]) : null;
+    if (pool) for (const [v, hint] of pool) {
+      if (v.startsWith(prefix) && v !== prefix)
+        out.push({ label: v, hint, ins: v + " ", rs: valStart, re: caret });
+      if (out.length >= 6) break;
+    }
+  }
+  return out.slice(0, 6);
+}
+function applyCompletion(i) {
+  const s = sugList[i];
+  const v = searchBox.value;
+  searchBox.value = v.slice(0, s.rs) + s.ins + v.slice(s.re);
+  searchBox.focus();
+  const pos = s.rs + s.ins.length;
+  searchBox.setSelectionRange(pos, pos);
+  applySearch(searchBox.value);
+}
+function updateSearchSel() {
+  const items = searchResults.querySelectorAll(".sr-item");
+  items.forEach((el, i) => el.classList.toggle("sel", i === searchSel));
+  if (items[searchSel]) items[searchSel].scrollIntoView({ block: "nearest" });
+}
+function parseDurationMs(s) { // "3s" · "300ms" · "1.5m" · bare number = ms
+  const m = /^(\d+(?:\.\d+)?)(ms|s|m)?$/.exec(s);
+  if (!m) return null;
+  return parseFloat(m[1]) * (m[2] === "s" ? 1000 : m[2] === "m" ? 60000 : 1);
+}
+function numericPredicate(val, parse) {
+  const m = /^(>=|<=|>|<|=)?(.*)$/.exec(val);
+  const num = parse(m[2]);
+  if (num == null) return null;
+  const op = m[1] || ">=";
+  return x => x != null &&
+    (op === ">=" ? x >= num : op === "<=" ? x <= num :
+     op === ">" ? x > num : op === "<" ? x < num : x === num);
+}
+function nameTest(q) {
+  if (q.includes("*")) {
+    const re = new RegExp(q.split("*").map(s => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join(".*"));
+    return t => re.test(t.name.toLowerCase());
+  }
+  return t => t.name.toLowerCase().includes(q);
+}
+function compileToken(tok) {
+  const neg = tok.length > 1 && tok.startsWith("-");
+  if (neg) tok = tok.slice(1);
+  const m = /^([a-z]+):(.+)$/.exec(tok);
+  const key = m && { type: "kind", kind: "kind", rule: "rule", dur: "dur", duration: "dur",
+                     slack: "slack", start: "start", end: "end", deps: "deps",
+                     dependents: "dependents", is: "is" }[m[1]];
+  let p = null;
+  if (key) {
+    const val = m[2];
+    if (key === "kind") {
+      const wants = val.split(",").filter(Boolean);
+      p = t => wants.some(w => t.kind.startsWith(w));
+    } else if (key === "rule") {
+      p = t => t.ruleName.toLowerCase().includes(val);
+    } else if (key === "is") {
+      p = val === "cp" ? t => !!t.cp :
+          val === "built" ? t => t.start != null :
+          val === "notbuilt" ? t => t.start == null : null;
+    } else if (key === "deps" || key === "dependents") {
+      const num = numericPredicate(val, s => /^\d+$/.test(s) ? +s : null);
+      if (num) p = key === "deps" ? t => num(t.deps.length) : t => num(succs[t.id].length);
+    } else { // dur / slack / start / end
+      const num = numericPredicate(val, parseDurationMs);
+      if (num) p = t => num(t[key]);
+    }
+  }
+  // unknown keys and unparsable values fall back to plain name text (paths
+  // may legitimately contain a colon, e.g. on Windows)
+  if (!p) p = nameTest(tok);
+  return neg ? t => !p(t) : p;
+}
+function applySearch(raw) {
+  const caret = searchBox.value === raw ? (searchBox.selectionStart ?? raw.length) : raw.length;
+  sugList = computeSuggestions(raw, caret);
+  const q = raw.trim().toLowerCase();
+  let matches = null; // null: query too short, filter nothing
+  if (q.length >= 2) {
+    const preds = q.split(/\s+/).map(compileToken);
+    matches = T.filter(t => preds.every(p => p(t)));
+  }
+  actualView.filterIds = simView.filterIds = matches && new Set(matches.map(t => t.id));
+  searchBox.classList.toggle("active", matches !== null);
+  actualView.render(); simView.render();
+  syncHash(raw);
+  searchTop = matches ? [...matches].sort((a, b) => b.dur - a.dur).slice(0, 8) : [];
+  searchSpan = null;
+  if (!sugList.length && matches === null) {
+    searchResults.style.display = "none";
+    return;
+  }
+  const sugHtml = sugList.map((s, i) =>
+    `<div class="sr-item sr-sug" data-sug="${i}"><span class="nm">${esc(s.label)}</span>` +
+    `<span class="dur">${i === 0 ? "⇥ tab · " : ""}${esc(s.hint)}</span></div>`).join("");
+  let allHtml = "";
+  if (matches !== null) {
+    if (!matches.length) {
+      allHtml = `<div class="sr-head">0 of ${N} tasks match</div>`;
+    } else {
+      let work = 0, t0 = Infinity, t1 = -Infinity;
+      for (const t of matches) {
+        work += t.dur;
+        if (t.start != null) {
+          if (t.start < t0) t0 = t.start;
+          if (t.end > t1) t1 = t.end;
+        }
+      }
+      if (t1 > t0) searchSpan = [t0, t1];
+      const stats = `${fmtMs(work)} work (${(100 * work / Math.max(M.work, 1)).toFixed(0)}% of build)` +
+        (searchSpan ? ` · ${fmtMs(t0)} → ${fmtMs(t1)}` : "");
+      allHtml = `<div class="sr-item sr-all" data-all="1">` +
+        `<div>Show all <b>${matches.length}</b> of ${N} matching tasks in the timeline</div>` +
+        `<div class="sr-stats">${stats}</div></div>`;
+    }
+  }
+  searchResults.innerHTML = sugHtml + allHtml +
+    searchTop.map(t =>
+      `<div class="sr-item" data-id="${t.id}">` +
+      `<span class="sw" style="background:${kindColor(t.kind)};flex:none"></span>` +
+      `<span class="nm">${esc(t.name)}</span><span class="dur">${fmtMs(t.dur, true)}</span></div>`).join("") +
+    `<div class="sr-foot">type:compile,link · rule:cxx · dur:&gt;1s · slack:&lt;50ms · start:&gt;10s · ` +
+    `deps:&gt;3 · dependents:&gt;10 · is:cp · is:notbuilt · -token negates · * wildcard</div>`;
+  searchResults.style.display = "";
+  // Enter defaults to "show all" when there are matches; completions are
+  // reached with Tab, arrow keys, or the mouse
+  searchSel = matches && matches.length ? sugList.length : 0;
+  updateSearchSel();
+}
+// "show all": commit the filter and frame the matched time range
+function searchShowAll() {
+  searchResults.style.display = "none";
+  searchBox.blur();
+  go("timeline");
+  if (searchSpan) actualView.focusRange(searchSpan[0], searchSpan[1]);
+}
+function searchJump(id) {
+  searchResults.style.display = "none";
+  go("timeline");
+  actualView.focusTask(id); showDetail(id);
+}
+searchBox.addEventListener("input", e => applySearch(e.target.value));
+searchBox.addEventListener("focus", () => applySearch(searchBox.value));
+searchBox.addEventListener("blur", () => setTimeout(() => { searchResults.style.display = "none"; }, 150));
+searchResults.addEventListener("mousedown", e => { // mousedown: runs before the input's blur
+  const item = e.target.closest(".sr-item");
+  if (!item) return;
+  if (item.dataset.sug) { e.preventDefault(); applyCompletion(+item.dataset.sug); } // keep typing
+  else if (item.dataset.all) searchShowAll();
+  else searchJump(+item.dataset.id);
+});
+searchBox.addEventListener("keydown", e => {
+  const rows = searchResults.querySelectorAll(".sr-item"); // suggestions + "show all" + top tasks
+  if ((e.key === "ArrowDown" || e.key === "ArrowUp") && rows.length) {
+    e.preventDefault(); // keep the caret still; move the list selection instead
+    searchSel = (searchSel + (e.key === "ArrowDown" ? 1 : -1) + rows.length) % rows.length;
+    updateSearchSel();
+  } else if (e.key === "Tab" && !e.shiftKey && sugList.length) {
+    e.preventDefault();
+    const el = rows[searchSel];
+    applyCompletion(el && el.dataset.sug ? +el.dataset.sug : 0);
+  } else if (e.key === "Enter" && rows.length) {
+    const el = rows[searchSel] || rows[0];
+    if (el.dataset.sug) applyCompletion(+el.dataset.sug);
+    else if (el.dataset.all) searchShowAll();
+    else searchJump(+el.dataset.id);
+  } else if (e.key === "Escape") {
+    if (searchResults.style.display !== "none") {
+      searchResults.style.display = "none"; // stage 1: close the list, keep the filter
+    } else {
+      searchBox.value = "";                 // stage 2: clear everything
+      applySearch("");
+      searchBox.blur();
+    }
+    e.stopPropagation(); // keep Esc from also restoring the maximized detail panel
+  }
+});
+document.addEventListener("keydown", e => {
+  if (e.key === "/" && !/^(INPUT|TEXTAREA)$/.test(document.activeElement.tagName)) {
+    e.preventDefault();
+    searchBox.focus(); searchBox.select();
+  }
+});
+// restore a #q=… query from a shared link (filter applies, list stays closed);
+// hashchange covers pasting a #q into the address bar of an open report
+function restoreHashQuery() {
+  if (!location.hash.startsWith("#q=")) return;
+  try {
+    searchBox.value = decodeURIComponent(location.hash.slice(3));
+    applySearch(searchBox.value);
+    searchResults.style.display = "none";
+  } catch {}
+}
+restoreHashQuery();
+addEventListener("hashchange", restoreHashQuery);
 
 // ------------------------------------------- bridge (interactive mode) ---
 // The same page is served either as a static file or by `ninjascope.py
