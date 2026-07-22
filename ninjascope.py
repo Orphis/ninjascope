@@ -53,6 +53,9 @@ class Edge:
     outputs: list[str] = field(default_factory=list)   # normalized keys
     inputs: list[str] = field(default_factory=list)    # explicit + implicit + order-only
     display: str = ""                                   # first output as written
+    raw_out: list[str] = field(default_factory=list)   # explicit outputs as written ($out)
+    raw_in: list[str] = field(default_factory=list)    # explicit inputs as written ($in)
+    bindings: dict[str, str] = field(default_factory=dict)  # edge vars, unexpanded
 
 
 class NinjaManifest:
@@ -60,6 +63,7 @@ class NinjaManifest:
         self.builddir = builddir
         self.scope: dict[str, str] = {}
         self.edges: list[Edge] = []
+        self.rule_bindings: dict[str, dict[str, str]] = {}  # rule name -> raw vars
 
     def norm(self, path: str) -> str:
         """Canonical key for a path: absolute, forward slashes, casefolded."""
@@ -70,21 +74,31 @@ class NinjaManifest:
 
     def parse(self, path: Path) -> None:
         text = path.read_text(encoding="utf-8", errors="replace")
+        context: dict[str, str] | None = None  # bindings of the open rule/build block
         for line in self._logical_lines(text):
             if not line or line.lstrip().startswith("#"):
                 continue
             if line[0] in " \t":
-                continue  # indented binding inside rule/build/pool: not needed
+                # indented binding inside the current rule/build block, kept
+                # unexpanded: rule vars like $FLAGS resolve per-edge later
+                if context is not None and "=" in line:
+                    key, _, value = line.partition("=")
+                    context[key.strip()] = value.strip()
+                continue
             keyword = line.split(None, 1)[0]
+            context = None
             if keyword == "build":
-                self._parse_build(line)
+                context = self._parse_build(line)
+            elif keyword == "rule":
+                name = line.split()[1]
+                context = self.rule_bindings.setdefault(name, {})
             elif keyword in ("include", "subninja"):
                 sub = self._expand_path_list(line.split(None, 1)[1])[0]
                 subpath = Path(sub)
                 if not subpath.is_absolute():
                     subpath = self.builddir / subpath
                 self.parse(subpath)
-            elif keyword in ("rule", "pool", "default"):
+            elif keyword in ("pool", "default"):
                 continue
             elif "=" in line:
                 key, _, value = line.partition("=")
@@ -106,8 +120,13 @@ class NinjaManifest:
         if pending:
             yield pending
 
-    def _expand(self, s: str) -> str:
-        """Expand $var / ${var} and unescape $$, '$ ', $: in a plain value."""
+    def _expand(self, s: str, resolve=None) -> str:
+        """Expand $var / ${var} and unescape $$, '$ ', $: in a plain value.
+
+        `resolve(name) -> str` overrides the default file-scope lookup.
+        """
+        if resolve is None:
+            resolve = lambda name: self.scope.get(name, "")
         out = []
         i, n = 0, len(s)
         while i < n:
@@ -125,13 +144,49 @@ class NinjaManifest:
                 i += 1
             elif c == "{":
                 j = s.index("}", i)
-                out.append(self.scope.get(s[i + 1:j], ""))
+                out.append(resolve(s[i + 1:j]))
                 i = j + 1
             else:
                 m = re.match(r"[A-Za-z0-9_.-]+", s[i:])
-                out.append(self.scope.get(m.group(0), "") if m else "$")
+                out.append(resolve(m.group(0)) if m else "$")
                 i += len(m.group(0)) if m else 0
         return "".join(out)
+
+    @staticmethod
+    def _quote(path: str) -> str:
+        return f'"{path}"' if " " in path else path
+
+    def command(self, edge: Edge) -> str | None:
+        """The expanded command line for `edge` (None for phony edges).
+
+        Resolution order matches ninja: $in/$out specials, then edge bindings,
+        then rule bindings, then file scope. Values referenced from rule vars
+        are themselves expanded recursively (with a cycle guard).
+        """
+        template = self.rule_bindings.get(edge.rule, {}).get("command")
+        if not template:
+            return None
+        resolving: set[str] = set()
+
+        def resolve(name: str) -> str:
+            if name == "in":
+                return " ".join(self._quote(p) for p in edge.raw_in)
+            if name == "out":
+                return " ".join(self._quote(p) for p in edge.raw_out)
+            if name in resolving:
+                return ""
+            raw = edge.bindings.get(name)
+            if raw is None:
+                raw = self.rule_bindings.get(edge.rule, {}).get(name)
+            if raw is None:
+                return self.scope.get(name, "")
+            resolving.add(name)
+            try:
+                return self._expand(raw, resolve)
+            finally:
+                resolving.discard(name)
+
+        return self._expand(template, resolve)
 
     def _expand_path_list(self, s: str) -> list[str]:
         """Split a path list on unescaped spaces, expanding vars and escapes."""
@@ -167,7 +222,7 @@ class NinjaManifest:
             tokens.append("".join(cur))
         return tokens
 
-    def _parse_build(self, line: str) -> None:
+    def _parse_build(self, line: str) -> dict[str, str] | None:
         body = line[len("build"):]
         # first unescaped ':' separates outputs from rule+inputs
         colon = None
@@ -181,7 +236,7 @@ class NinjaManifest:
                 break
             i += 1
         if colon is None:
-            return
+            return None
         outs_part, ins_part = body[:colon], body[colon + 1:]
 
         def split_sections(part: str) -> list[str]:
@@ -202,24 +257,31 @@ class NinjaManifest:
             sections.append("".join(cur))
             return sections
 
-        out_paths: list[str] = []
-        for sec in split_sections(outs_part):
+        out_sections = split_sections(outs_part)
+        explicit_outs = self._expand_path_list(out_sections[0])
+        out_paths = list(explicit_outs)
+        for sec in out_sections[1:]:
             out_paths += self._expand_path_list(sec)
         in_sections = split_sections(ins_part)
         rule_and_ins = self._expand_path_list(in_sections[0])
         if not rule_and_ins or not out_paths:
-            return
+            return None
         rule = rule_and_ins[0]
-        in_paths = rule_and_ins[1:]
+        explicit_ins = rule_and_ins[1:]
+        in_paths = list(explicit_ins)
         for sec in in_sections[1:]:
             in_paths += self._expand_path_list(sec)
 
-        self.edges.append(Edge(
+        edge = Edge(
             rule=rule,
             outputs=[self.norm(p) for p in out_paths],
             inputs=[self.norm(p) for p in in_paths],
             display=out_paths[0],
-        ))
+            raw_out=explicit_outs,
+            raw_in=explicit_ins,
+        )
+        self.edges.append(edge)
+        return edge.bindings
 
 
 # --------------------------------------------------------------------------
@@ -488,7 +550,8 @@ def classify_rule(rule: str) -> str:
 # main
 # --------------------------------------------------------------------------
 
-def build_report(builddir: Path, title: str | None, no_deps: bool):
+def build_report(builddir: Path, title: str | None, no_deps: bool,
+                 no_commands: bool = False):
     """Parse the build dir; return (data dict for the template, tasks, manifest)."""
     manifest_path = builddir / "build.ninja"
     log_path = builddir / ".ninja_log"
@@ -558,21 +621,25 @@ def build_report(builddir: Path, title: str | None, no_deps: bool):
             "speedup": speedup,
         },
         "rules": [{"name": r, "kind": classify_rule(r)} for r in rules],
-        "tasks": [
-            {
-                "name": display_name(t),
-                "rule": rule_idx[t.edge.rule],
-                "start": t.start,
-                "end": t.end,
-                "dur": t.dur,
-                "deps": sorted(t.deps),
-                "slack": slack[t.id],
-                "cp": t.id in cp_set,
-            }
-            for t in tasks
-        ],
+        "tasks": [],
         "criticalPath": cp_path,
     }
+    for t in tasks:
+        entry = {
+            "name": display_name(t),
+            "rule": rule_idx[t.edge.rule],
+            "start": t.start,
+            "end": t.end,
+            "dur": t.dur,
+            "deps": sorted(t.deps),
+            "slack": slack[t.id],
+            "cp": t.id in cp_set,
+        }
+        if not no_commands:
+            cmd = manifest.command(t.edge)
+            if cmd:
+                entry["cmd"] = cmd
+        data["tasks"].append(entry)
 
     print(f"wall time      : {wall / 1000:.1f}s")
     print(f"total work     : {work / 1000:.1f}s  (avg parallelism {work / max(wall, 1):.1f}x)")
@@ -911,6 +978,9 @@ def main() -> None:
     ap.add_argument("--title", default=None, help="report title")
     ap.add_argument("--no-deps", action="store_true",
                     help="skip `ninja -t deps` (generated-header dependencies)")
+    ap.add_argument("--no-commands", action="store_true",
+                    help="omit per-task command lines from the report "
+                         "(smaller output for very large builds)")
     ap.add_argument("--interactive", action="store_true",
                     help="serve the report from a live process with compiler "
                          "profiling (clang -ftime-trace) instead of writing a file")
@@ -921,7 +991,8 @@ def main() -> None:
     args = ap.parse_args()
 
     builddir: Path = args.builddir.resolve()
-    data, tasks, manifest = build_report(builddir, args.title, args.no_deps)
+    data, tasks, manifest = build_report(builddir, args.title, args.no_deps,
+                                         args.no_commands)
     html = render_html(data)
 
     if args.interactive:

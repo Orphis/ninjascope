@@ -53,7 +53,8 @@ compare the critical paths and the speedup curves instead.)
 Works on any Ninja build directory (CMake, GN, Meson, …), not just the sample.
 `uv run ninjascope.py …` also works (PEP 723 metadata, stdlib-only).
 
-Options: `-o out.html`, `--title "…"`, `--no-deps` (skip `ninja -t deps`).
+Options: `-o out.html`, `--title "…"`, `--no-deps` (skip `ninja -t deps`),
+`--no-commands` (omit per-task command lines — smaller reports for very large builds).
 
 ## Interactive mode: compiler profiling
 
