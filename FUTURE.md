@@ -66,3 +66,83 @@ slow because of this header").
    (needed for `ninja -t commands <output>`).
 2. The task detail panel is kept pluggable so a button + result pane can be added without
    reworking the layout.
+
+
+# NinjaScope — Follow-up: Hosted in-browser generator (dual-mode template)
+
+Future improvement discussed on 2026-07-22, while evaluating non-Python rewrites for speed
+and portability. Context: users are C++ developers (no Node/Deno assumed; python3 and a
+browser are the only safe runtimes), and reports must remain **stored, self-contained HTML
+artifacts** — which ruled out a browser page as a *replacement* for the CLI, but not as a
+second generator.
+
+## The idea
+
+A hosted static page (e.g. GitHub Pages, zero backend) that parses a build directory
+entirely client-side and produces the same report:
+
+- Drag the build dir onto the page → lazy directory walk → parse `build.ninja` +
+  included/subninja'd `*.ninja` + `.ninja_log` + `.ninja_deps` in JS → run the graph
+  analysis → render the report in place.
+- **Download report.html** = inject the computed payload into the page's own HTML source and
+  save. The stored-artifact workflow is preserved; the hosted page is just another way to
+  produce the same file.
+
+## Dual-mode template
+
+Make one artifact of template.html: payload embedded → render the report (today's behavior);
+no payload → show the drop zone and generate in-browser. Then the hosted page, the stored
+report, and the CLI output are the **same HTML file** — no separate "app" to maintain.
+
+## Browser support (verified reasoning, 2026-07)
+
+- `showDirectoryPicker()` / File System Access API (persistent handles, auto-refresh,
+  write-back): **Chromium-only**. Firefox has declined it; Safari only has OPFS.
+- Drag-and-drop via the **File and Directory Entries API** (`webkitGetAsEntry()`): works in
+  Firefox and Safari too, and the walk is *lazy* — only the handful of ninja files are ever
+  opened, never the gigabytes of object files.
+- Avoid `<input webkitdirectory>`: eagerly enumerates the whole build dir (~100k files,
+  scary confirmation prompt).
+- Output download (Blob + `a[download]`) is universal.
+- So: core flow is cross-browser; only conveniences (folder picker, remembered dir,
+  live refresh) are Chromium-gated — ship them as progressive enhancement.
+
+## Hard requirements / limits
+
+- **`.ninja_deps` binary parser in JS is mandatory** — no `ninja -t deps` subprocess exists
+  in a browser. Format is versioned (v3/v4); detect the version and fail clearly on unknown.
+- `include`/`subninja` paths that escape the dropped directory (absolute paths) are
+  unreachable — detect and warn rather than silently building a wrong graph.
+- Interactive mode (clang `-ftime-trace` re-runs) inherently needs a local process:
+  **CLI-only forever**.
+- Privacy note on the page: command lines can reveal internal paths; everything stays
+  client-side, nothing is uploaded. Works offline once cached.
+
+## The strategic fork (decide before building)
+
+1. **Add-on**: JS analyzer next to the full Python analyzer → analysis logic maintained in
+   two languages, golden-diff both. Fine for a prototype, poor long-term.
+2. **End state**: the JS analyzer becomes the single implementation (shared by hosted page
+   and template); the Python CLI shrinks to a thin headless shell (read files, run the same
+   logic, embed payload) for CI/stored generation. Cleaner, but is effectively the
+   TypeScript rewrite of the analysis core.
+
+Recommendation from the discussion: only pursue this if willing to land on (2).
+
+## First milestone (pays off even if the page never ships)
+
+1. ~~**`.ninja_deps` binary parser in Python**~~ — DONE 2026-07-22 (`parse_ninja_deps` in
+   ninjascope.py, verified byte-identical against `ninja -t deps` on the webrtc build;
+   0.09s vs 1.5s subprocess, falls back to the tool on unknown versions). A JS port can
+   mirror it 1:1.
+2. **Dual-mode template plumbing** (payload-or-dropzone switch in template.html).
+
+## Related perf notes (2026-07-22 state, webrtc build dir)
+
+- CLI generation was optimized 27s → 7.2s (commit 61b5bd1), then → 3.3s (producer-closure
+  sharing/caching in `build_tasks`, direct `.ninja_deps` parsing). Remaining profile:
+  ~1s manifest parse, ~1.1s build_tasks, ~0.8s export+startup — diminishing returns from
+  here in pure Python.
+- For stored/CI reports, **payload size** may matter more than speed: ~35MB of the 41MB JSON
+  is near-duplicate command lines — interning commands against per-rule templates is the big
+  size lever (needs matching template.html decoding).

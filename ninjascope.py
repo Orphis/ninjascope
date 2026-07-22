@@ -27,6 +27,7 @@ import base64
 import json
 import os
 import re
+from array import array
 import shutil
 import subprocess
 import sys
@@ -339,6 +340,64 @@ def parse_ninja_log(path: Path, manifest: NinjaManifest):
 # discovered deps (generated headers)
 # --------------------------------------------------------------------------
 
+def ninja_deps_version(builddir: Path) -> int | None:
+    """The .ninja_deps format version, or None if absent/unrecognized."""
+    try:
+        with (builddir / ".ninja_deps").open("rb") as f:
+            header = f.read(16)
+    except OSError:
+        return None
+    if len(header) < 16 or not header.startswith(b"# ninjadeps\n"):
+        return None
+    return int.from_bytes(header[12:16], "little")
+
+
+def parse_ninja_deps(builddir: Path, manifest: NinjaManifest) -> dict[str, list[str]] | None:
+    """Parse .ninja_deps (format v3/v4) directly, without running ninja.
+
+    The file is a sequence of 4-byte-size-prefixed records: path records
+    (string padded to 4-byte alignment + ~id checksum) assign sequential ids,
+    deps records (high bit set in the size) hold [output_id, mtime, dep_ids...]
+    with the last record per output winning. Returns None on anything
+    unexpected so the caller can fall back to `ninja -t deps`.
+    """
+    version = ninja_deps_version(builddir)
+    if version not in (3, 4) or array("I").itemsize != 4:
+        return None
+    mtime_words = 1 if version == 3 else 2  # v4 widened mtime to 64 bits
+    try:
+        data = (builddir / ".ninja_deps").read_bytes()
+    except OSError:
+        return None
+    norm = manifest.norm
+    paths: list[str] = []                    # path id -> normalized key
+    dep_ids_by_out: dict[int, "array"] = {}
+    pos, n = 16, len(data)
+    try:
+        while pos + 4 <= n:
+            header = int.from_bytes(data[pos:pos + 4], "little")
+            pos += 4
+            size = header & 0x7FFFFFFF
+            if pos + size > n:
+                break  # truncated tail record (interrupted write); ignore
+            if header & 0x80000000:
+                ids = array("I", data[pos:pos + size])
+                if sys.byteorder == "big":
+                    ids.byteswap()
+                dep_ids_by_out[ids[0]] = ids[1 + mtime_words:]
+            else:
+                checksum = int.from_bytes(data[pos + size - 4:pos + size], "little")
+                if checksum != ~len(paths) & 0xFFFFFFFF:
+                    return None  # corrupt / not the layout we expect
+                raw = data[pos:pos + size - 4].rstrip(b"\x00")
+                paths.append(norm(raw.decode("utf-8", errors="replace")))
+            pos += size
+        return {paths[out]: [paths[d] for d in dep_ids]
+                for out, dep_ids in dep_ids_by_out.items()}
+    except (IndexError, ValueError):
+        return None
+
+
 def run_deps_tool(builddir: Path) -> str | None:
     """Run `ninja -t deps` and return its stdout (None if ninja is missing)."""
     try:
@@ -392,53 +451,83 @@ def build_tasks(manifest: NinjaManifest, log: dict[str, tuple[int, int]],
         for o in e.outputs:
             edge_by_output.setdefault(o, idx)
 
-    # producers(path) -> set of real (non-phony) edge indices, seen through phony
-    prod_cache: dict[int, frozenset[int]] = {}
+    # producers(path) -> set of real (non-phony) edge indices, seen through
+    # phony. Cache entries are (sid, set) pairs: the sid is a value-canonical
+    # id assigned once at creation, so the per-input hot path below is plain
+    # dict gets — no frozenset hashing and no Python call on cache hits.
+    set_ids: dict[frozenset[int], int] = {}
+    prod_cache: dict[int, tuple[int, frozenset[int]]] = {}
 
-    def edge_producers(idx: int, stack: frozenset[int] = frozenset()) -> frozenset[int]:
-        if idx in prod_cache:
-            return prod_cache[idx]
-        if idx in stack:
-            return frozenset()
+    def intern(fs: frozenset[int]) -> tuple[int, frozenset[int]]:
+        sid = set_ids.get(fs)
+        if sid is None:
+            sid = set_ids[fs] = len(set_ids)
+        return (sid, fs)
+
+    visiting: set[int] = set()   # DFS path, for cycle detection
+    combo_cache: dict[frozenset[int], tuple[int, frozenset[int]]] = {}
+
+    def edge_producers(idx: int) -> tuple[int, frozenset[int]]:
+        ent = prod_cache.get(idx)
+        if ent is not None:
+            return ent
+        if idx in visiting:
+            return intern(frozenset())  # cycle guard; not cached for idx
         e = manifest.edges[idx]
         if e.rule != "phony":
-            result = frozenset([idx])
+            ent = prod_cache[idx] = intern(frozenset([idx]))
+            return ent
+        visiting.add(idx)
+        pget = prod_cache.get
+        jget = edge_by_output.get
+        children: dict[int, frozenset[int]] = {}
+        for p in e.inputs:
+            j = jget(p)
+            if j is not None:
+                c = pget(j) or edge_producers(j)
+                if c[1]:
+                    children[c[0]] = c[1]
+        visiting.discard(idx)
+        if not children:
+            ent = intern(frozenset())
+        elif len(children) == 1:
+            # alias phony: share the child's set instead of copying it
+            ent = intern(next(iter(children.values())))
         else:
-            acc: set[int] = set()
-            for p in e.inputs:
-                j = edge_by_output.get(p)
-                if j is not None:
-                    acc |= edge_producers(j, stack | {idx})
-            result = frozenset(acc)
-        prod_cache[idx] = result
-        return result
-
-    def path_producers(path: str) -> frozenset[int]:
-        j = edge_by_output.get(path)
-        return edge_producers(j) if j is not None else frozenset()
+            key = frozenset(children)
+            ent = combo_cache.get(key)
+            if ent is None:
+                ent = combo_cache[key] = intern(
+                    frozenset().union(*children.values()))
+        prod_cache[idx] = ent
+        return ent
 
     # real-edge dependency sets (edge idx -> frozenset of edge idx). Whole
     # groups of edges combine the same producer sets (GN stamp fan-outs), so
     # the merged union is cached by the combination of producer-set ids and
     # shared instead of re-unioned per edge.
-    set_ids: dict[frozenset[int], int] = {}
     merge_cache: dict[frozenset[int], frozenset[int]] = {}
     edge_deps: dict[int, frozenset[int]] = {}
+    ebo_get = edge_by_output.get
+    cache_get = prod_cache.get
+    disc_get = discovered.get
     for idx, e in enumerate(manifest.edges):
         if e.rule == "phony":
             continue
         parts: dict[int, frozenset[int]] = {}
         for p in e.inputs:
-            fs = path_producers(p)
-            if fs:
-                sid = set_ids.setdefault(fs, len(set_ids))
-                parts[sid] = fs
+            j = ebo_get(p)
+            if j is not None:
+                ent = cache_get(j) or edge_producers(j)
+                if ent[1]:
+                    parts[ent[0]] = ent[1]
         for o in e.outputs:
-            for dep_path in discovered.get(o, ()):
-                fs = path_producers(dep_path)
-                if fs:
-                    sid = set_ids.setdefault(fs, len(set_ids))
-                    parts[sid] = fs
+            for dep_path in disc_get(o, ()):
+                j = ebo_get(dep_path)
+                if j is not None:
+                    ent = cache_get(j) or edge_producers(j)
+                    if ent[1]:
+                        parts[ent[0]] = ent[1]
         key = frozenset(parts)
         merged = merge_cache.get(key)
         if merged is None:
@@ -448,17 +537,26 @@ def build_tasks(manifest: NinjaManifest, log: dict[str, tuple[int, int]],
             merged = merged - {idx}
         edge_deps[idx] = merged
 
-    # keep edges that were built (in the log) plus anything they depend on
+    # keep edges that were built (in the log) plus anything they depend on;
+    # a shared dep set only needs expanding once, not per referencing edge
     logged = {idx for idx, e in enumerate(manifest.edges)
               if e.rule != "phony" and any(o in log for o in e.outputs)}
     keep: set[int] = set()
+    expanded: set[int] = set()
     frontier = list(logged)
     while frontier:
         idx = frontier.pop()
         if idx in keep:
             continue
         keep.add(idx)
-        frontier += [d for d in edge_deps.get(idx, ()) if d not in keep]
+        ds = edge_deps.get(idx)
+        if not ds:
+            continue
+        k = id(ds)  # sets are shared and kept alive by edge_deps
+        if k in expanded:
+            continue
+        expanded.add(k)
+        frontier += [d for d in ds if d not in keep]
 
     unlogged_kept = keep - logged
     order = sorted(keep)
@@ -641,13 +739,18 @@ def build_report(builddir: Path, title: str | None, no_deps: bool,
     if not log_path.exists():
         sys.exit(f"error: {log_path} not found (run a build first)")
 
-    # the deps tool is an external process that only needs builddir, so it
-    # runs concurrently with the (pure-Python) manifest parse below
+    # discovered deps come from .ninja_deps, parsed directly when the format
+    # is a known version. Otherwise fall back to the `ninja -t deps` tool —
+    # an external process that only needs builddir, so it runs concurrently
+    # with the (pure-Python) manifest parse below.
     deps_future = None
     deps_executor = None
+    use_binary_deps = False
     if not no_deps:
-        deps_executor = ThreadPoolExecutor(max_workers=1)
-        deps_future = deps_executor.submit(run_deps_tool, builddir)
+        use_binary_deps = ninja_deps_version(builddir) in (3, 4)
+        if not use_binary_deps:
+            deps_executor = ThreadPoolExecutor(max_workers=1)
+            deps_future = deps_executor.submit(run_deps_tool, builddir)
 
     manifest = NinjaManifest(builddir)
     manifest.parse(manifest_path)
@@ -660,7 +763,11 @@ def build_report(builddir: Path, title: str | None, no_deps: bool,
               "results use a clean full build.", file=sys.stderr)
 
     discovered = {}
-    if deps_future is not None:
+    if use_binary_deps:
+        discovered = parse_ninja_deps(builddir, manifest)
+        if discovered is None:  # corrupt mid-file: fall back to the tool
+            discovered = parse_deps_output(run_deps_tool(builddir), manifest)
+    elif deps_future is not None:
         discovered = parse_deps_output(deps_future.result(), manifest)
         deps_executor.shutdown()
 
