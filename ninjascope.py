@@ -23,6 +23,7 @@ aggregate the most expensive headers / templates / functions.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import re
@@ -32,6 +33,7 @@ import sys
 import tempfile
 import threading
 import webbrowser
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -621,25 +623,36 @@ def build_report(builddir: Path, title: str | None, no_deps: bool,
             "speedup": speedup,
         },
         "rules": [{"name": r, "kind": classify_rule(r)} for r in rules],
-        "tasks": [],
         "criticalPath": cp_path,
     }
+    # tasks are emitted columnar, with dependency lists interned: whole groups
+    # of tasks share identical dep sets (GN stamp fan-outs especially), and
+    # materializing each copy is what makes naive exports quadratic-ish
+    dep_lists: list[list[int]] = []
+    dep_index: dict[tuple[int, ...], int] = {}
+    cols: dict[str, list] = {k: [] for k in
+                             ("name", "rule", "start", "end", "dur", "dl", "slack", "cp")}
+    cmds: list[str | None] | None = None if no_commands else []
     for t in tasks:
-        entry = {
-            "name": display_name(t),
-            "rule": rule_idx[t.edge.rule],
-            "start": t.start,
-            "end": t.end,
-            "dur": t.dur,
-            "deps": sorted(t.deps),
-            "slack": slack[t.id],
-            "cp": t.id in cp_set,
-        }
-        if not no_commands:
-            cmd = manifest.command(t.edge)
-            if cmd:
-                entry["cmd"] = cmd
-        data["tasks"].append(entry)
+        key = tuple(sorted(t.deps))
+        di = dep_index.get(key)
+        if di is None:
+            di = dep_index[key] = len(dep_lists)
+            dep_lists.append(list(key))
+        cols["name"].append(display_name(t))
+        cols["rule"].append(rule_idx[t.edge.rule])
+        cols["start"].append(t.start)
+        cols["end"].append(t.end)
+        cols["dur"].append(t.dur)
+        cols["dl"].append(di)
+        cols["slack"].append(slack[t.id])
+        cols["cp"].append(1 if t.id in cp_set else 0)
+        if cmds is not None:
+            cmds.append(manifest.command(t.edge))
+    if cmds is not None:
+        cols["cmd"] = cmds
+    data["tasksCols"] = cols
+    data["depLists"] = dep_lists
 
     print(f"wall time      : {wall / 1000:.1f}s")
     print(f"total work     : {work / 1000:.1f}s  (avg parallelism {work / max(wall, 1):.1f}x)")
@@ -648,9 +661,23 @@ def build_report(builddir: Path, title: str | None, no_deps: bool,
     return data, tasks, manifest
 
 
-def render_html(data: dict) -> str:
+def render_html(data: dict, compress: bool | None = None) -> str:
+    """Embed the data payload; compress it when it is large.
+
+    compress=None (auto) deflates payloads over 1 MB — the page inflates them
+    with the browser-native DecompressionStream, so nothing else is needed.
+    """
     template = (Path(__file__).parent / "template.html").read_text(encoding="utf-8")
-    payload = json.dumps(data, separators=(",", ":")).replace("</", "<\\/")
+    raw = json.dumps(data, separators=(",", ":"))
+    if compress is None:
+        compress = len(raw) > 1_000_000
+    if compress:
+        z = base64.b64encode(zlib.compress(raw.encode("utf-8"), 9)).decode("ascii")
+        payload = json.dumps({"z": z})
+        print(f"payload        : {len(raw) / 1e6:.1f} MB JSON -> "
+              f"{len(z) / 1e6:.1f} MB compressed")
+    else:
+        payload = raw.replace("</", "<\\/")
     return template.replace("/*__NINJASCOPE_DATA__*/null", payload)
 
 
@@ -981,6 +1008,9 @@ def main() -> None:
     ap.add_argument("--no-commands", action="store_true",
                     help="omit per-task command lines from the report "
                          "(smaller output for very large builds)")
+    ap.add_argument("--no-compress", action="store_true",
+                    help="embed the data as plain JSON even when large "
+                         "(readable/greppable report source)")
     ap.add_argument("--ignore-file", type=Path, default=None,
                     help="file of finding ids to suppress, one fnmatch-style "
                          "pattern per line, '#' comments (default: "
@@ -1007,7 +1037,7 @@ def main() -> None:
                     if ln.strip() and not ln.strip().startswith("#")]
         data["meta"]["ignore"] = patterns
         print(f"ignore list    : {len(patterns)} pattern(s) from {ignore_path}")
-    html = render_html(data)
+    html = render_html(data, compress=False if args.no_compress else None)
 
     if args.interactive:
         serve(Bridge(builddir, html, tasks, manifest), args.port, not args.no_open)

@@ -54,7 +54,9 @@ Works on any Ninja build directory (CMake, GN, Meson, …), not just the sample.
 `uv run ninjascope.py …` also works (PEP 723 metadata, stdlib-only).
 
 Options: `-o out.html`, `--title "…"`, `--no-deps` (skip `ninja -t deps`),
-`--no-commands` (omit per-task command lines — smaller reports for very large builds),
+`--no-commands` (omit per-task command lines),
+`--no-compress` (payloads over 1 MB are deflate-compressed automatically; this keeps
+the embedded JSON readable instead),
 `--ignore-file` (suppress Insights findings by id, one fnmatch pattern per line;
 `<builddir>/.ninjascope-ignore` is picked up automatically).
 

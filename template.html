@@ -412,7 +412,35 @@
 <div class="tooltip" id="tooltip"></div>
 
 <script>
-const DATA = /*__NINJASCOPE_DATA__*/null;
+const PAYLOAD = /*__NINJASCOPE_DATA__*/null;
+
+// Large builds embed the JSON deflate-compressed and base64-encoded
+// ({z: "..."}); the browser-native DecompressionStream unpacks it.
+async function loadData() {
+  if (!PAYLOAD || !PAYLOAD.z) return PAYLOAD;
+  const bytes = Uint8Array.from(atob(PAYLOAD.z), ch => ch.charCodeAt(0));
+  const text = await new Response(new Blob([bytes]).stream()
+    .pipeThrough(new DecompressionStream("deflate"))).text();
+  return JSON.parse(text);
+}
+// Tasks travel columnar with interned dependency lists (many tasks share the
+// exact same deps — GN stamp groups especially). Rebuild row objects so the
+// rest of the page keeps its natural shape; dep arrays are shared, read-only.
+function inflateTasks(d) {
+  const c = d.tasksCols;
+  const tasks = c.name.map((name, i) => {
+    const t = { name, rule: c.rule[i], start: c.start[i], end: c.end[i],
+                dur: c.dur[i], deps: d.depLists[c.dl[i]], slack: c.slack[i],
+                cp: !!c.cp[i] };
+    if (c.cmd && c.cmd[i] != null) t.cmd = c.cmd[i];
+    return t;
+  });
+  return { ...d, tasks };
+}
+loadData().then(d => bootReport(inflateTasks(d)))
+  .catch(err => { document.body.textContent = "failed to load report data: " + err; });
+
+function bootReport(DATA) {
 
 // ---------------------------------------------------------------- helpers ---
 const $ = id => document.getElementById(id);
@@ -2170,6 +2198,8 @@ new ResizeObserver(() => {
 
 paintSwatches();
 renderSpeedupChart();
+
+} // bootReport
 </script>
 </body>
 </html>
