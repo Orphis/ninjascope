@@ -122,6 +122,32 @@
     position: relative; top: 1px; user-select: none;
   }
   .tab.active { background: var(--surface-1); border-color: var(--border); color: var(--text-primary); font-weight: 600; }
+  .tab .badge {
+    font-size: 10.5px; background: var(--critical); color: #fff;
+    border-radius: 9px; padding: 1px 6px; margin-left: 6px;
+  }
+  .digest { margin-top: 18px; font-size: 14px; line-height: 1.55; }
+  .digest .lever {
+    display: inline-block; font-size: 12.5px; padding: 3px 10px; border-radius: 16px;
+    margin: 6px 8px 0 0; cursor: pointer;
+    background: color-mix(in srgb, var(--critical) 9%, transparent);
+    border: 1px solid color-mix(in srgb, var(--critical) 35%, transparent);
+  }
+  .digest .lever b { color: var(--critical); }
+  .sev { width: 9px; height: 9px; border-radius: 50%; display: inline-block; margin-right: 4px; }
+  .x-tr td { background: color-mix(in srgb, var(--text-primary) 3%, transparent); }
+  .x-box { max-width: 900px; font-size: 12.5px; color: var(--text-secondary); padding: 2px 6px 4px 20px; }
+  .x-box p { margin: 6px 0; }
+  .x-box b { color: var(--text-primary); }
+  .x-foot { margin-top: 8px; color: var(--text-muted); font-size: 11.5px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  /* mostly-short columns: pin the narrow ones so "distinct via" absorbs the
+     leftover width instead of the index/length columns stretching */
+  #ncpTable { table-layout: fixed; }
+  #ncpTable th:nth-child(1) { width: 34px; }
+  #ncpTable th:nth-child(2) { width: 84px; }
+  #ncpTable th:nth-child(3) { width: 70px; }
+  #ncpTable th:nth-child(5) { width: 64px; }
+  #ncpTable td { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .view { display: none; }
   .view.active { display: block; }
 
@@ -266,10 +292,12 @@
   <div class="tabbar">
     <div class="tab active" data-view="overview">Overview</div>
     <div class="tab" data-view="timeline">Timeline</div>
+    <div class="tab" data-view="insights">Insights<span class="badge" id="insightsBadge" style="display:none"></span></div>
     <div class="tab" data-view="profile">Profiling</div>
   </div>
 
   <div class="view active" id="view-overview">
+    <div class="digest panel" id="digest" style="display:none"></div>
     <div class="tiles" id="tiles"></div>
 
     <section>
@@ -338,6 +366,26 @@
           </div>
         </div>
       </div>
+    </section>
+  </div>
+
+  <div class="view" id="view-insights">
+    <section>
+      <h2>Top levers</h2>
+      <p class="sub">Critical-path tasks ranked by <b>measured payoff</b>: the wall-time floor is recomputed with each task hypothetically free, so a big task whose parallel sibling path is nearly as long correctly shows a small gain. Click a row to locate the task.</p>
+      <div class="panel cp-table"><table id="leversTable"></table></div>
+    </section>
+
+    <section>
+      <h2>Findings</h2>
+      <p class="sub">Deterministic checks over the DAG and the measured schedule — no heuristics beyond the stated thresholds. Click a row to see the evidence in the timeline. False positives (each row's tooltip shows its id) can be listed in <code>&lt;builddir&gt;/.ninjascope-ignore</code> or a <code>--ignore-file</code>, one fnmatch pattern per line.</p>
+      <div class="panel cp-table"><table id="findingsTable"></table></div>
+    </section>
+
+    <section>
+      <h2>Near-critical paths</h2>
+      <p class="sub" id="ncpSub"></p>
+      <div class="panel cp-table"><table id="ncpTable"></table></div>
     </section>
   </div>
 
@@ -431,13 +479,16 @@ const topo = (() => {
   return order;
 })();
 
-// downstream critical-path length: the scheduling priority
+// downstream critical-path length: the scheduling priority (bestSucc mirrors
+// bestPred so a full longest path through any task can be reconstructed)
 const tails = new Float64Array(N);
+const bestSucc = new Int32Array(N).fill(-1);
 for (let k = N - 1; k >= 0; k--) {
   const i = topo[k];
-  let best = 0;
-  for (const s of succs[i]) if (tails[s] > best) best = tails[s];
+  let best = 0, bs = -1;
+  for (const s of succs[i]) if (tails[s] > best) { best = tails[s]; bs = s; }
   tails[i] = T[i].dur + best;
+  bestSucc[i] = bs;
 }
 
 // upstream critical-path length: the longest dependency chain ending at each
@@ -1222,11 +1273,14 @@ fetch("/api/ping").then(r => (r.ok ? r.json() : null)).then(info => {
 let selectedTask = null;
 let flameView = null;
 
-// highlight the critical path leading to `id` in both gantt views
-function setPathHighlight(id) {
-  const ids = id == null ? null : new Set(pathTo(id));
+// highlight an arbitrary set of tasks in both gantt views (rest dims)
+function highlightIdSet(ids) {
   actualView.pathIds = simView.pathIds = ids;
   actualView.render(); simView.render();
+}
+// highlight the critical path leading to `id`
+function setPathHighlight(id) {
+  highlightIdSet(id == null ? null : new Set(pathTo(id)));
 }
 
 function closeDetail() {
@@ -1327,15 +1381,15 @@ for (const listId of ["detailDeps", "detailRdeps"]) {
     if (row) { actualView.focusTask(+row.dataset.id); showDetail(+row.dataset.id); }
   });
 }
-$("cmdCopy").addEventListener("click", async () => {
-  const btn = $("cmdCopy");
+async function copyText(text, btn) {
+  const label = btn.textContent;
   try {
-    await navigator.clipboard.writeText($("cmdText").textContent);
+    await navigator.clipboard.writeText(text);
     btn.textContent = "copied";
   } catch { // clipboard API is unavailable on file:// in some browsers
     try {
       const ta = document.createElement("textarea");
-      ta.value = $("cmdText").textContent;
+      ta.value = text;
       document.body.append(ta);
       ta.select();
       document.execCommand("copy");
@@ -1345,8 +1399,9 @@ $("cmdCopy").addEventListener("click", async () => {
       btn.textContent = "failed";
     }
   }
-  setTimeout(() => { btn.textContent = "copy"; }, 1200);
-});
+  setTimeout(() => { btn.textContent = label; }, 1200);
+}
+$("cmdCopy").addEventListener("click", () => copyText($("cmdText").textContent, $("cmdCopy")));
 
 // maximize: full-viewport overlay; flame lanes switch to a fixed readable
 // height and the depth cap is lifted so the whole stack is visible
@@ -1656,6 +1711,428 @@ $("cpTable").addEventListener("click", e => {
   go("timeline");
   actualView.focusTask(id); showDetail(id);
 });
+
+// ---------------------------------------------------------------- insights ---
+// Deterministic advisor: everything below is computed from the DAG and the
+// measured schedule already in the page — no heuristics beyond the stated
+// thresholds, and every gain figure is an exact recomputation.
+function locateTask(id) {
+  go("timeline");
+  actualView.focusTask(id); showDetail(id);
+}
+const shortName = n => n.split("/").pop();
+const wallMs = Math.max(M.wall, 1);
+
+// longest path with one task's duration zeroed: the exact wall-time floor if
+// that task were free. Only CP tasks can gain (zeroing off-CP tasks changes
+// nothing), and a near-critical sibling path correctly caps the gain.
+function cpWithout(x) {
+  const h = new Float64Array(N);
+  let best = 0;
+  for (const i of topo) {
+    let m = 0;
+    for (const d of T[i].deps) if (h[d] > m) m = h[d];
+    h[i] = m + (i === x ? 0 : T[i].dur);
+    if (h[i] > best) best = h[i];
+  }
+  return best;
+}
+const levers = DATA.criticalPath
+  .map(id => ({ id, gain: M.cpLength - cpWithout(id) }))
+  .filter(l => l.gain > 0.005 * M.cpLength)
+  .sort((a, b) => b.gain - a.gain)
+  .slice(0, 8);
+$("leversTable").innerHTML =
+  "<thead><tr><th>#</th><th>task</th><th>kind</th><th class='num'>duration</th><th class='pct-cell'>max wall-time gain</th></tr></thead><tbody>" +
+  (levers.length ? levers.map((l, i) => {
+    const t = T[l.id];
+    return `<tr data-id="${l.id}"><td>${i + 1}</td><td>${esc(t.name)}</td>` +
+      `<td><span class="chip"><span class="sw" data-kind="${t.kind}"></span>${t.kind}</span></td>` +
+      `<td class='num'>${fmtMs(t.dur, true)}</td>` +
+      `<td class='pct-cell'><span class="pctbar" style="background:var(--critical);width:${Math.max(Math.round(90 * l.gain / levers[0].gain), 2)}px"></span>−${fmtMs(l.gain, true)}</td></tr>`;
+  }).join("") : "<tr><td colspan='5'>no critical-path task yields a measurable gain</td></tr>") +
+  "</tbody>";
+$("leversTable").addEventListener("click", e => {
+  const row = e.target.closest("tr[data-id]");
+  if (row) locateTask(+row.dataset.id);
+});
+
+// average concurrency over a time range, from the measured schedule
+function makeConcIntegral(items) {
+  const steps = concurrencySteps(items);
+  const times = steps.map(s => s[0]);
+  const cum = [0];
+  for (let j = 1; j < steps.length; j++)
+    cum[j] = cum[j - 1] + steps[j - 1][1] * (times[j] - times[j - 1]);
+  const at = t => {
+    let lo = 0, hi = times.length - 1, idx = 0;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (times[mid] <= t) { idx = mid; lo = mid + 1; } else hi = mid - 1;
+    }
+    return cum[idx] + steps[idx][1] * (t - times[idx]);
+  };
+  return (s, e) => e <= s ? 0 : (at(e) - at(s)) / (e - s);
+}
+
+// finding ids are stable across builds (built from task names); patterns from
+// the ignore file (meta.ignore, fnmatch-style) suppress matching findings —
+// and for coarse-dep:* they exclude the task's edges from the analysis itself,
+// so a legitimately archive-consuming generator doesn't pollute the numbers
+const IGNORE_RES = (M.ignore || []).map(p => new RegExp(
+  "^" + p.split("*").map(s => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join(".*") + "$"));
+const isIgnored = fid => IGNORE_RES.some(re => re.test(fid));
+let ignoredCount = 0;
+
+const findings = []; // {sev: high|med|low, fid, title, evidence, id|ids}
+const collapsedCoarse = []; // coarse sources beyond the top 3, behind an expander
+function pushFinding(f) {
+  if (isIgnored(f.fid)) ignoredCount++;
+  else findings.push(f);
+}
+const avgConc = makeConcIntegral(actualItems);
+
+// serialization points: long tasks measured running (nearly) alone
+for (const t of T) {
+  if (t.start == null || t.dur < 0.02 * wallMs) continue;
+  const c = avgConc(t.start, t.end);
+  if (c <= 2.5) pushFinding({
+    sev: t.dur > 0.05 * wallMs ? "high" : "med",
+    fid: `serialization:${t.name}`,
+    type: "serialization", x: { tid: t.id, c },
+    title: `Serialization point: <code>${esc(shortName(t.name))}</code> runs ${c < 1.3 ? "alone" : "nearly alone"} for ${fmtMs(t.dur, true)}`,
+    evidence: `avg ${c.toFixed(1)} tasks running during it · ${(100 * t.dur / wallMs).toFixed(0)}% of wall time`,
+    id: t.id,
+  });
+}
+
+// Coarse dependencies. Suspicious edges are ones whose consumption can't be
+// real: compiles read headers and codegen runs tools — neither ever *uses* an
+// archive, so compile→archive/link and codegen→archive edges exist only for
+// (over-)ordering. codegen→link is legit: that's executing a built generator,
+// and everything behind it is correctly serialized. Removing the suspicious
+// edges and recomputing earliest starts gives each task's exact avoidable
+// start delay — cause (source tasks) and effect (delayed compiles) combined.
+{
+  const suspiciousOf = new Map(); // task id -> Set(dep ids to drop)
+  for (const t of T) {
+    let bad = null;
+    if (t.kind === "compile")
+      bad = t.deps.filter(d => T[d].kind === "archive" || T[d].kind === "link");
+    else if (t.kind === "codegen")
+      bad = t.deps.filter(d => T[d].kind === "archive");
+    if (bad && bad.length && !isIgnored(`coarse-dep:${t.name}`))
+      suspiciousOf.set(t.id, new Set(bad));
+  }
+  // earliest starts in the world where those deps were file-level
+  const heads2 = new Float64Array(N);
+  let cpFixed = 0; // the dependency floor of that world
+  for (const i of topo) {
+    let m = 0;
+    const skip = suspiciousOf.get(i);
+    for (const d of T[i].deps) {
+      if (skip && skip.has(d)) continue;
+      if (heads2[d] > m) m = heads2[d];
+    }
+    heads2[i] = m + T[i].dur;
+    if (heads2[i] > cpFixed) cpFixed = heads2[i];
+  }
+  const delta = i => heads[i] - heads2[i];
+
+  // worst individual sources (root causes), then the blast radius; sources
+  // beyond the top 3 are all kept, rendered behind an expander
+  const sources = [...suspiciousOf.keys()]
+    .filter(i => delta(i) > 0.01 * wallMs)
+    .sort((a, b) => delta(b) - delta(a));
+  const mkCoarse = i => {
+    const t = T[i], bad = [...suspiciousOf.get(i)];
+    return {
+      sev: delta(i) > 0.05 * wallMs ? "high" : "med",
+      fid: `coarse-dep:${t.name}`,
+      type: "coarse", x: { tid: i, bad, delta: delta(i), then: heads2[i] - t.dur },
+      title: `Coarse dependency: ${t.kind} <code>${esc(shortName(t.name))}</code> waits on ` +
+        (bad.length > 1 ? `${bad.length} archives` : `archive <code>${esc(shortName(T[bad[0]].name))}</code>`),
+      evidence: `could start ${fmtMs(delta(i))} earlier if it depended on files instead of whole targets`,
+      id: i,
+    };
+  };
+  for (const i of sources.slice(0, 3)) pushFinding(mkCoarse(i));
+  for (const i of sources.slice(3)) collapsedCoarse.push(mkCoarse(i));
+  const affected = [...Array(N).keys()]
+    .filter(i => T[i].kind === "compile" && delta(i) > 0.005 * wallMs);
+  if (affected.length) {
+    const avg = affected.reduce((s, i) => s + delta(i), 0) / affected.length;
+    const worst = affected.reduce((a, b) => delta(a) >= delta(b) ? a : b);
+    pushFinding({
+      sev: delta(worst) > 0.05 * wallMs ? "high" : "med",
+      fid: "coarse-blast",
+      type: "blast",
+      x: { count: affected.length, avg, worstId: worst, worstDelta: delta(worst),
+           sources: suspiciousOf.size, cpFixed },
+      title: `Coarse dependencies serialize ${affected.length} compiles behind archives`,
+      evidence: `${suspiciousOf.size} tasks carry archive-level deps; the downstream compiles could start ` +
+        `${fmtMs(avg)} earlier on average (worst: <code>${esc(shortName(T[worst].name))}</code>, ` +
+        `${fmtMs(delta(worst))}) — click to light up the affected compiles`,
+      ids: affected,
+    });
+  }
+}
+
+// core starvation on the critical path: CP tasks that sat ready but unscheduled
+{
+  let cpQueued = 0, worst = null;
+  for (const id of DATA.criticalPath) {
+    const t = T[id];
+    if (t.start == null) continue;
+    let ready = 0, known = t.deps.length === 0;
+    for (const d of t.deps) if (T[d].end != null) { known = true; if (T[d].end > ready) ready = T[d].end; }
+    if (!known) continue;
+    const q = Math.max(t.start - ready, 0);
+    cpQueued += q;
+    if (!worst || q > worst.q) worst = { id, q };
+  }
+  if (cpQueued > 0.03 * wallMs) pushFinding({
+    sev: cpQueued > 0.08 * wallMs ? "high" : "med",
+    fid: "cp-starved",
+    type: "starved", x: { cpQueued, worstId: worst.id, worstQ: worst.q },
+    title: `Critical path starved of cores for ${fmtMs(cpQueued)}`,
+    evidence: `ready-but-unscheduled time summed over CP tasks (worst: <code>${esc(shortName(T[worst.id].name))}</code>, ${fmtMs(worst.q, true)}) — this part of the wall time needs more cores, not a better graph`,
+    id: worst.id,
+  });
+}
+
+// slow-TU outliers vs. the median compile
+{
+  const compiles = T.filter(t => t.kind === "compile" && t.dur > 0).sort((a, b) => a.dur - b.dur);
+  if (compiles.length >= 8) {
+    const med = compiles[compiles.length >> 1].dur;
+    for (const t of compiles.filter(t => t.dur > 3 * med && t.dur > 0.015 * wallMs).slice(-3).reverse())
+      pushFinding({
+        sev: "low",
+        fid: `slow-tu:${t.name}`,
+        type: "slowtu", x: { tid: t.id, med },
+        title: `Slow TU: <code>${esc(shortName(t.name))}</code> at ${fmtMs(t.dur, true)}`,
+        evidence: `${(t.dur / med).toFixed(1)}× the median compile (${fmtMs(med, true)}) — profile it in interactive mode`,
+        id: t.id,
+      });
+  }
+}
+
+// ---- per-finding explanations: templated from the computed values ----
+function transitiveDependents(id) {
+  const seen = new Set([id]), stack = [id];
+  while (stack.length)
+    for (const s of succs[stack.pop()]) if (!seen.has(s)) { seen.add(s); stack.push(s); }
+  return seen.size - 1;
+}
+function kneePoint() { // smallest core count within 5% of the dependency floor
+  for (const p of M.speedup) if (p.cores != null && p.makespan <= 1.05 * M.cpLength) return p;
+  return null;
+}
+const xsec = (h, body) => `<p><b>${h}.</b> ${body}</p>`;
+function explainHtml(f, idx) {
+  const parts = [];
+  if (f.type === "serialization") {
+    const t = T[f.x.tid], depCount = transitiveDependents(f.x.tid);
+    parts.push(
+      xsec("What this means", `For ${fmtMs(t.dur, true)} (${(100 * t.dur / wallMs).toFixed(0)}% of the build), the machine averaged ${f.x.c.toFixed(1)} running tasks — roughly ${Math.max(M.peakConcurrency - Math.round(f.x.c), 0)} cores sat idle waiting for this one step. Little else was runnable: ${depCount} of ${N} tasks depend on it, directly or transitively.`),
+      xsec("How it was measured", `Average concurrency is integrated from the actual <code>.ninja_log</code> schedule over this task's runtime, not inferred from the graph. Threshold: tasks ≥2% of wall running with &lt;2.5 average neighbors.`),
+      xsec("What to do", `Split the step so consumers with different needs wait on different pieces, ` +
+        (t.start != null && t.start < 0.01 * wallMs
+          ? `start it earlier (it already starts at ${fmtMs(t.start)} — as early as possible), `
+          : `start it earlier (it currently starts at ${fmtMs(t.start)}), `) +
+        `or make it faster${t.cmd ? ` — the command line is in the task detail` : ""}.` +
+        (t.kind === "codegen" ? ` If it is a version-stamp-style generator, consider <code>restat = 1</code> so unchanged output stops downstream rebuilds.` : "")),
+      xsec("What won't help", `More cores (there is nothing to schedule), and optimizing any task downstream of it (they are all gated).`));
+  } else if (f.type === "coarse") {
+    const t = T[f.x.tid];
+    const badNames = f.x.bad.slice(0, 3).map(d => `<code>${esc(shortName(T[d].name))}</code>`).join(", ");
+    parts.push(
+      xsec("What this means", `This ${t.kind} step's dependencies include ${f.x.bad.length} archive${f.x.bad.length > 1 ? "s" : ""} (${badNames}${f.x.bad.length > 3 ? ", …" : ""}). ${t.kind === "codegen" ? "Codegen reads files and runs tools" : "A compile reads headers"}; it has no use for an archive — these edges almost certainly exist because a build-system target-level dependency stood in for a file-level one (in CMake: cross-directory custom commands can't depend on another directory's outputs, so the dependency coarsens to the whole target).`),
+      xsec("How it was measured", `Earliest-possible starts were recomputed with the archive-level edges removed: this task could start ${fmtMs(f.x.delta)} earlier (at ${fmtMs(f.x.then)} instead of ${fmtMs(heads[f.x.tid] - t.dur)}). Its other dependencies are ready long before the archives are.`),
+      xsec("What to do", `Depend on the <i>files</i> this step actually reads. In CMake, declare the custom command in the same directory as its dependencies, or anchor the needed file with its own <code>add_custom_target</code> and depend on that — not on the library target.`),
+      xsec("If this is intentional", `Some generators genuinely consume archives — suppress this finding with its id below; the blast-radius numbers will recompute without it.`));
+  } else if (f.type === "blast") {
+    const worst = T[f.x.worstId];
+    parts.push(
+      xsec("What this means", `${f.x.count} compiles inherit archive-level dependencies they don't need: each sits behind an archive it never reads. This is the aggregate cost of the coarse-dependency findings above.`),
+      xsec("How it was measured", `The same edge-removal recomputation, summed over downstream compiles: average avoidable start delay ${fmtMs(f.x.avg)}, worst <code>${esc(shortName(worst.name))}</code> at ${fmtMs(f.x.worstDelta)}. With file-level deps the dependency floor would be <b>${fmtMs(f.x.cpFixed)}</b> instead of ${fmtMs(M.cpLength)}. Click the finding row to see the affected compiles lit in the timeline — a staircase pattern (each layer starting after the previous layer's archives) is the visual signature.`),
+      xsec("What to do", `Fix the ${f.x.sources} source tasks (see the individual findings); the ${f.x.count} compiles heal automatically. There is nothing to change in the compiles themselves.`));
+  } else if (f.type === "starved") {
+    const worst = T[f.x.worstId], knee = kneePoint();
+    parts.push(
+      xsec("What this means", `Tasks on the critical path spent a combined ${fmtMs(f.x.cpQueued)} ready-to-run but waiting for a free core — ${(100 * f.x.cpQueued / wallMs).toFixed(0)}% of the ${fmtMs(M.wall)} wall time. During those windows the bottleneck wasn't the dependency graph; it was ${M.peakConcurrency} cores servicing every runnable task at once. The graph's floor is ${fmtMs(M.cpLength)}; the schedule delivered ${fmtMs(M.wall)}, and this queueing is most of the difference.`),
+      xsec("How it was measured", `For each critical-path task: <code>start − max(end of its deps)</code>, summed. Worst single wait: <code>${esc(shortName(worst.name))}</code>, ${fmtMs(f.x.worstQ, true)}.`),
+      xsec("What to do", `This is the one finding where hardware is the answer` +
+        (knee ? `: the what-if simulator predicts ${fmtMs(knee.makespan)} at ${knee.cores} cores (${(M.wall / knee.makespan).toFixed(1)}× faster)` : "") +
+        `. Alternatively, reducing total work (fewer or cheaper compiles) shrinks the queue contention.`),
+      xsec("What won't help", `Restructuring dependencies — the graph already permits more parallelism than the cores can absorb.`));
+  } else if (f.type === "slowtu") {
+    const t = T[f.x.tid];
+    parts.push(
+      xsec("What this means", `This translation unit compiles ${(t.dur / f.x.med).toFixed(1)}× slower than the median compile in this build (${fmtMs(t.dur, true)} vs ${fmtMs(f.x.med, true)}). Every core-batch it lands in stretches by the difference.`),
+      xsec("How it was measured", `Duration vs. the median of all compiles; threshold 3× and ≥1.5% of wall.`),
+      xsec("What to do", `Profile it: in interactive mode, the <i>Profile with -ftime-trace</i> button in the task detail shows where the time goes (includes vs. template instantiation vs. codegen). Typical fixes ranked by frequency: an expensive header pulled in transitively, a template instantiated hundreds of times (<code>extern template</code> helps), or a huge function tripping the optimizer.`));
+  }
+  return `<div class="x-box">${parts.join("")}` +
+    `<div class="x-foot"><code>${esc(f.fid)}</code> in the ignore file suppresses this finding · ` +
+    `<button class="btn btn-mini prompt-btn" data-x="${idx}">copy as agent prompt</button></div></div>`;
+}
+function buildPrompt(f) {
+  const strip = html => { const d = document.createElement("div"); d.innerHTML = html; return d.textContent; };
+  const t = f.id != null ? T[f.id] : null;
+  return `NinjaScope finding for the ninja build in ${M.builddir}:\n\n` +
+    `${strip(f.title)}\nEvidence: ${strip(f.evidence)}\n\n${strip(explainHtml(f, -1)).trim()}\n\n` +
+    (t ? `Task: ${t.name}\nNinja rule: ${t.ruleName}\n${t.cmd ? `Command: ${t.cmd}\n` : ""}` : "") +
+    `\nPlease investigate the build files (CMakeLists.txt / build.ninja rules) and propose a concrete fix.`;
+}
+
+const SEV_RANK = { high: 0, med: 1, low: 2 };
+findings.sort((a, b) => SEV_RANK[a.sev] - SEV_RANK[b.sev]);
+const FIND = findings.concat(collapsedCoarse); // one index space for explain/prompt
+const sevColor = { high: "var(--critical)", med: "var(--kind-archive)", low: "var(--text-muted)" };
+const findingRow = (f, i, hidden) =>
+  `<tr class="${hidden ? "x-hidden" : ""}"${hidden ? ' style="display:none"' : ""} ` +
+  `${f.ids ? `data-ids="${f.ids.join(",")}"` : `data-id="${f.id}"`} ` +
+  `title="id: ${esc(f.fid)} — list it in the ignore file to suppress">` +
+  `<td><span class="sev" style="background:${sevColor[f.sev]}"></span> ${f.title}</td>` +
+  `<td>${f.evidence}</td>` +
+  `<td class="num"><button class="btn btn-mini x-btn" data-x="${i}">explain</button></td></tr>`;
+const findingRows = findings.map((f, i) => findingRow(f, i, false));
+if (collapsedCoarse.length) {
+  // slot the collapsed sources right after the blast row that aggregates them
+  const at = findings.findIndex(f => f.fid === "coarse-blast");
+  findingRows.splice((at >= 0 ? at : findingRows.length - 1) + 1, 0,
+    `<tr class="x-more"><td colspan="3" style="color:var(--text-muted);cursor:pointer">▸ show ${collapsedCoarse.length} more coarse dependencies</td></tr>`,
+    ...collapsedCoarse.map((f, j) => findingRow(f, findings.length + j, true)));
+}
+$("findingsTable").innerHTML =
+  "<thead><tr><th>finding</th><th>evidence</th><th></th></tr></thead><tbody>" +
+  (findingRows.length ? findingRows.join("")
+    : "<tr><td colspan='3'>no findings — nothing rises above the thresholds</td></tr>") +
+  (ignoredCount ? `<tr><td colspan='3' style="color:var(--text-muted)">${ignoredCount} finding${ignoredCount > 1 ? "s" : ""} suppressed by the ignore list</td></tr>` : "") +
+  "</tbody>";
+$("findingsTable").addEventListener("click", e => {
+  const more = e.target.closest(".x-more");
+  if (more) {
+    const hidden = $("findingsTable").querySelectorAll(".x-hidden");
+    const show = hidden[0].style.display === "none";
+    hidden.forEach(h => {
+      h.style.display = show ? "" : "none";
+      if (!show) { // also fold any open explanations under the hidden rows
+        const n = h.nextElementSibling;
+        if (n && n.classList.contains("x-tr")) n.remove();
+        h.querySelector(".x-btn").textContent = "explain";
+      }
+    });
+    more.firstElementChild.textContent =
+      `${show ? "▾ hide" : "▸ show"} ${collapsedCoarse.length} more coarse dependencies`;
+    return;
+  }
+  const xbtn = e.target.closest(".x-btn");
+  if (xbtn) {
+    const tr = xbtn.closest("tr");
+    const next = tr.nextElementSibling;
+    if (next && next.classList.contains("x-tr")) {
+      next.remove();
+      xbtn.textContent = "explain";
+    } else {
+      const ex = document.createElement("tr");
+      ex.className = "x-tr";
+      ex.innerHTML = `<td colspan="3">${explainHtml(FIND[+xbtn.dataset.x], +xbtn.dataset.x)}</td>`;
+      tr.after(ex);
+      xbtn.textContent = "hide";
+    }
+    return;
+  }
+  const pbtn = e.target.closest(".prompt-btn");
+  if (pbtn) {
+    copyText(buildPrompt(FIND[+pbtn.dataset.x]), pbtn);
+    return;
+  }
+  const row = e.target.closest("tr[data-id], tr[data-ids]");
+  if (!row) return;
+  if (row.dataset.ids) {
+    highlightIdSet(new Set(row.dataset.ids.split(",").map(Number)));
+    go("timeline");
+  } else {
+    locateTask(+row.dataset.id);
+  }
+});
+if (findings.length + collapsedCoarse.length) {
+  $("insightsBadge").textContent = findings.length + collapsedCoarse.length;
+  $("insightsBadge").style.display = "";
+}
+
+// near-critical paths: top-3 distinct longest chains, via heads/tails
+function pathThroughTask(i) {
+  const path = [];
+  for (let u = bestPred[i]; u >= 0; u = bestPred[u]) path.unshift(u);
+  path.push(i);
+  for (let v = bestSucc[i]; v >= 0; v = bestSucc[v]) path.push(v);
+  return path;
+}
+const through = i => heads[i] + tails[i] - T[i].dur;
+const ncPaths = [{ len: M.cpLength, path: DATA.criticalPath, via: null }];
+{
+  const used = new Set(DATA.criticalPath);
+  for (let k = 2; k <= 3; k++) {
+    let best = -1;
+    for (let i = 0; i < N; i++)
+      if (!used.has(i) && T[i].dur > 0 && (best < 0 || through(i) > through(best))) best = i;
+    if (best < 0 || through(best) <= 0) break;
+    const p = pathThroughTask(best);
+    ncPaths.push({ len: through(best), path: p, via: best });
+    p.forEach(x => used.add(x));
+  }
+}
+const cpWidth = ncPaths.length > 1 ? M.cpLength - ncPaths[1].len : null;
+$("ncpSub").innerHTML = cpWidth != null
+  ? `<b>CP width ${fmtMs(cpWidth, true)}</b> — improving path #1 by more than this moves the bottleneck to path #2. Click a row to light the path up in the timeline.`
+  : "No distinct alternative path — the DAG has a single dominant chain.";
+$("ncpTable").innerHTML =
+  "<thead><tr><th>#</th><th class='num'>length</th><th class='num'>vs CP</th><th>distinct via</th><th class='num'>tasks</th></tr></thead><tbody>" +
+  ncPaths.map((p, k) =>
+    `<tr data-k="${k}"><td>${k + 1}</td><td class='num'>${fmtMs(p.len)}</td>` +
+    `<td class='num'>${(100 * p.len / Math.max(M.cpLength, 1)).toFixed(0)}%</td>` +
+    `<td>${p.via == null ? "— (the critical path)" : esc(shortName(T[p.via].name))}</td>` +
+    `<td class='num'>${p.path.length}</td></tr>`).join("") + "</tbody>";
+$("ncpTable").addEventListener("click", e => {
+  const row = e.target.closest("tr[data-k]");
+  if (!row) return;
+  const p = ncPaths[+row.dataset.k];
+  highlightIdSet(new Set(p.path));
+  go("timeline");
+  let t0 = Infinity, t1 = -Infinity;
+  for (const id of p.path) {
+    const t = T[id];
+    if (t.start != null) { if (t.start < t0) t0 = t.start; if (t.end > t1) t1 = t.end; }
+  }
+  if (t1 > t0) actualView.focusRange(t0, t1);
+});
+
+// plain-language digest on the Overview tab
+{
+  const head = cpTasks[0];
+  const kindMix = Object.entries(cpByKind).sort((a, b) => b[1] - a[1])
+    .map(([k, v]) => `${(100 * v / Math.max(M.cpLength, 1)).toFixed(0)}% ${k}`).join(", ");
+  const top = levers[0];
+  $("digest").style.display = "";
+  $("digest").innerHTML =
+    `The critical path (<b>${fmtMs(M.cpLength)}</b>, ${(100 * M.cpLength / wallMs).toFixed(0)}% of wall time) ` +
+    `begins with <code>${esc(shortName(head.name))}</code> (${fmtMs(head.dur, true)}) and is ${kindMix}. ` +
+    (top ? `Best lever: <code>${esc(shortName(T[top.id].name))}</code> — up to <b style="color:var(--critical)">−${fmtMs(top.gain, true)}</b> off the floor.` : "") +
+    `<br>` +
+    levers.slice(0, 3).map((l, i) =>
+      `<span class="lever" data-id="${l.id}">${["①", "②", "③"][i]} ${esc(shortName(T[l.id].name))} <b>−${fmtMs(l.gain, true)}</b></span>`).join("") +
+    `<span class="lever" style="background:transparent" data-goto="insights">all insights →</span>`;
+  $("digest").addEventListener("click", e => {
+    const chip = e.target.closest(".lever");
+    if (!chip) return;
+    if (chip.dataset.goto) go(chip.dataset.goto);
+    else locateTask(+chip.dataset.id);
+  });
+}
 
 // -------------------------------------------------------------- theme etc ---
 const themeBtn = $("themeToggle");

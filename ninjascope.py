@@ -981,6 +981,10 @@ def main() -> None:
     ap.add_argument("--no-commands", action="store_true",
                     help="omit per-task command lines from the report "
                          "(smaller output for very large builds)")
+    ap.add_argument("--ignore-file", type=Path, default=None,
+                    help="file of finding ids to suppress, one fnmatch-style "
+                         "pattern per line, '#' comments (default: "
+                         "<builddir>/.ninjascope-ignore if present)")
     ap.add_argument("--interactive", action="store_true",
                     help="serve the report from a live process with compiler "
                          "profiling (clang -ftime-trace) instead of writing a file")
@@ -993,6 +997,16 @@ def main() -> None:
     builddir: Path = args.builddir.resolve()
     data, tasks, manifest = build_report(builddir, args.title, args.no_deps,
                                          args.no_commands)
+
+    ignore_path = args.ignore_file or builddir / ".ninjascope-ignore"
+    if args.ignore_file and not ignore_path.is_file():
+        sys.exit(f"error: ignore file not found: {ignore_path}")
+    if ignore_path.is_file():
+        patterns = [ln.strip() for ln in
+                    ignore_path.read_text(encoding="utf-8").splitlines()
+                    if ln.strip() and not ln.strip().startswith("#")]
+        data["meta"]["ignore"] = patterns
+        print(f"ignore list    : {len(patterns)} pattern(s) from {ignore_path}")
     html = render_html(data)
 
     if args.interactive:
