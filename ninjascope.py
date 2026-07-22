@@ -37,7 +37,7 @@ import zlib
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
-from heapq import heappop, heappush
+from heapq import heapify, heappop, heappush
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
@@ -66,13 +66,22 @@ class NinjaManifest:
         self.scope: dict[str, str] = {}
         self.edges: list[Edge] = []
         self.rule_bindings: dict[str, dict[str, str]] = {}  # rule name -> raw vars
+        self._norm_cache: dict[str, str] = {}
 
     def norm(self, path: str) -> str:
         """Canonical key for a path: absolute, forward slashes, casefolded."""
+        cached = self._norm_cache.get(path)
+        if cached is not None:
+            return cached
         p = path.replace("\\", "/")
-        if not re.match(r"^([A-Za-z]:/|/)", p):
+        absolute = p.startswith("/") or (
+            len(p) >= 3 and p[1] == ":" and p[2] == "/"
+            and ("A" <= p[0] <= "Z" or "a" <= p[0] <= "z"))
+        if not absolute:
             p = self.builddir.as_posix() + "/" + p
-        return os.path.normpath(p).replace("\\", "/").casefold()
+        result = os.path.normpath(p).replace("\\", "/").casefold()
+        self._norm_cache[path] = result
+        return result
 
     def parse(self, path: Path) -> None:
         text = path.read_text(encoding="utf-8", errors="replace")
@@ -113,6 +122,10 @@ class NinjaManifest:
         for raw in text.split("\n"):
             line = pending + (raw.lstrip() if pending else raw)
             stripped = line.rstrip("\r")
+            if not stripped.endswith("$"):
+                pending = ""
+                yield stripped
+                continue
             trailing = len(stripped) - len(stripped.rstrip("$"))
             if trailing % 2 == 1:
                 pending = stripped[:-1]
@@ -192,6 +205,8 @@ class NinjaManifest:
 
     def _expand_path_list(self, s: str) -> list[str]:
         """Split a path list on unescaped spaces, expanding vars and escapes."""
+        if "$" not in s:
+            return s.split()
         tokens, cur = [], []
         i, n = 0, len(s)
         while i < n:
@@ -228,21 +243,27 @@ class NinjaManifest:
         body = line[len("build"):]
         # first unescaped ':' separates outputs from rule+inputs
         colon = None
-        i = 0
-        while i < len(body):
-            if body[i] == "$":
-                i += 2
-                continue
-            if body[i] == ":":
-                colon = i
-                break
-            i += 1
+        if "$" not in body:
+            found = body.find(":")
+            colon = found if found >= 0 else None
+        else:
+            i = 0
+            while i < len(body):
+                if body[i] == "$":
+                    i += 2
+                    continue
+                if body[i] == ":":
+                    colon = i
+                    break
+                i += 1
         if colon is None:
             return None
         outs_part, ins_part = body[:colon], body[colon + 1:]
 
         def split_sections(part: str) -> list[str]:
             """Split on unescaped | and || into up to three sections."""
+            if "$" not in part:
+                return re.split(r"\|\|?", part)
             sections, cur = [], []
             i = 0
             while i < len(part):
@@ -318,8 +339,8 @@ def parse_ninja_log(path: Path, manifest: NinjaManifest):
 # discovered deps (generated headers)
 # --------------------------------------------------------------------------
 
-def parse_deps_tool(builddir: Path, manifest: NinjaManifest) -> dict[str, list[str]]:
-    """Run `ninja -t deps` and return {target_output_key: [dep_keys...]}."""
+def run_deps_tool(builddir: Path) -> str | None:
+    """Run `ninja -t deps` and return its stdout (None if ninja is missing)."""
     try:
         proc = subprocess.run(
             ["ninja", "-C", str(builddir), "-t", "deps"],
@@ -328,10 +349,17 @@ def parse_deps_tool(builddir: Path, manifest: NinjaManifest) -> dict[str, list[s
     except FileNotFoundError:
         print("warning: ninja not found on PATH; skipping discovered deps "
               "(generated-header dependencies may be missing)", file=sys.stderr)
+        return None
+    return proc.stdout
+
+
+def parse_deps_output(stdout: str | None, manifest: NinjaManifest) -> dict[str, list[str]]:
+    """Parse `ninja -t deps` output into {target_output_key: [dep_keys...]}."""
+    if stdout is None:
         return {}
     deps: dict[str, list[str]] = {}
     current: list[str] | None = None
-    for line in proc.stdout.splitlines():
+    for line in stdout.splitlines():
         if line.startswith((" ", "\t")):
             if current is not None:
                 current.append(manifest.norm(line.strip()))
@@ -354,7 +382,7 @@ class Task:
     start: int | None = None
     end: int | None = None
     dur: int = 0
-    deps: set[int] = field(default_factory=set)
+    dl: int = 0  # index into the shared dep-lists table
 
 
 def build_tasks(manifest: NinjaManifest, log: dict[str, tuple[int, int]],
@@ -389,19 +417,36 @@ def build_tasks(manifest: NinjaManifest, log: dict[str, tuple[int, int]],
         j = edge_by_output.get(path)
         return edge_producers(j) if j is not None else frozenset()
 
-    # real-edge dependency sets (edge idx -> set of edge idx)
-    edge_deps: dict[int, set[int]] = {}
+    # real-edge dependency sets (edge idx -> frozenset of edge idx). Whole
+    # groups of edges combine the same producer sets (GN stamp fan-outs), so
+    # the merged union is cached by the combination of producer-set ids and
+    # shared instead of re-unioned per edge.
+    set_ids: dict[frozenset[int], int] = {}
+    merge_cache: dict[frozenset[int], frozenset[int]] = {}
+    edge_deps: dict[int, frozenset[int]] = {}
     for idx, e in enumerate(manifest.edges):
         if e.rule == "phony":
             continue
-        dset: set[int] = set()
+        parts: dict[int, frozenset[int]] = {}
         for p in e.inputs:
-            dset |= path_producers(p)
+            fs = path_producers(p)
+            if fs:
+                sid = set_ids.setdefault(fs, len(set_ids))
+                parts[sid] = fs
         for o in e.outputs:
             for dep_path in discovered.get(o, ()):
-                dset |= path_producers(dep_path)
-        dset.discard(idx)
-        edge_deps[idx] = dset
+                fs = path_producers(dep_path)
+                if fs:
+                    sid = set_ids.setdefault(fs, len(set_ids))
+                    parts[sid] = fs
+        key = frozenset(parts)
+        merged = merge_cache.get(key)
+        if merged is None:
+            merged = frozenset().union(*parts.values()) if parts else frozenset()
+            merge_cache[key] = merged
+        if idx in merged:  # self-dependency (output listed among own inputs)
+            merged = merged - {idx}
+        edge_deps[idx] = merged
 
     # keep edges that were built (in the log) plus anything they depend on
     logged = {idx for idx, e in enumerate(manifest.edges)
@@ -418,65 +463,99 @@ def build_tasks(manifest: NinjaManifest, log: dict[str, tuple[int, int]],
     unlogged_kept = keep - logged
     order = sorted(keep)
     task_id = {edge_idx: i for i, edge_idx in enumerate(order)}
+    # dep lists are interned: tasks sharing a dep set share one list (its id)
+    dep_lists: list[list[int]] = []
+    dep_index: dict[frozenset[int], int] = {}
     tasks: list[Task] = []
     for edge_idx in order:
         e = manifest.edges[edge_idx]
-        t = Task(id=task_id[edge_idx], edge=e,
-                 deps={task_id[d] for d in edge_deps[edge_idx] if d in keep})
+        eds = edge_deps[edge_idx]
+        di = dep_index.get(eds)
+        if di is None:
+            di = dep_index[eds] = len(dep_lists)
+            dep_lists.append(sorted(task_id[d] for d in eds))
+        t = Task(id=task_id[edge_idx], edge=e, dl=di)
         for o in e.outputs:
             if o in log:
                 t.start, t.end = log[o]
                 t.dur = max(0, t.end - t.start)
                 break
         tasks.append(t)
-    return tasks, len(unlogged_kept)
+    return tasks, dep_lists, len(unlogged_kept)
 
 
-def topo_order(tasks: list[Task]) -> list[int]:
-    indeg = [len(t.deps) for t in tasks]
-    succs: list[list[int]] = [[] for _ in tasks]
-    for t in tasks:
-        for d in t.deps:
-            succs[d].append(t.id)
-    order = [i for i, d in enumerate(indeg) if d == 0]
+class TaskGraph:
+    """Two-level dependency structure over interned dep lists.
+
+    Tasks point at a shared dep list (`Task.dl`); propagation runs through the
+    few hundred unique lists instead of the millions of flattened task->task
+    edges they expand to, and is built once and reused by every pass.
+    """
+
+    def __init__(self, tasks: list[Task], dep_lists: list[list[int]]):
+        self.tasks = tasks
+        self.dep_lists = dep_lists
+        self.list_size = [len(l) for l in dep_lists]
+        # dep-list ids that task j appears in (its outgoing edges, grouped)
+        self.containing: list[list[int]] = [[] for _ in tasks]
+        for li, l in enumerate(dep_lists):
+            for d in l:
+                self.containing[d].append(li)
+        # tasks whose dep list is L (released together when L is satisfied)
+        self.tasks_with_dl: list[list[int]] = [[] for _ in dep_lists]
+        for t in tasks:
+            self.tasks_with_dl[t.dl].append(t.id)
+
+
+def topo_order(graph: TaskGraph) -> list[int]:
+    tasks = graph.tasks
+    pending = list(graph.list_size)
+    order = [t.id for t in tasks if pending[t.dl] == 0]
     head = 0
     while head < len(order):
         i = order[head]
         head += 1
-        for s in succs[i]:
-            indeg[s] -= 1
-            if indeg[s] == 0:
-                order.append(s)
+        for li in graph.containing[i]:
+            pending[li] -= 1
+            if pending[li] == 0:
+                order += graph.tasks_with_dl[li]
     if len(order) != len(tasks):
         sys.exit("error: dependency graph has a cycle (corrupt manifest?)")
     return order
 
 
-def critical_path(tasks: list[Task], order: list[int]):
+def critical_path(graph: TaskGraph, order: list[int]):
     """Longest path; returns (length_ms, [task ids along the path], slack per task)."""
-    ef = [0] * len(tasks)   # earliest finish
-    best_pred = [-1] * len(tasks)
+    tasks = graph.tasks
+    n = len(tasks)
+    ef = [0] * n            # earliest finish
+    best_pred = [-1] * n
+    max_ef = [0] * len(graph.dep_lists)    # max ef over a dep list's members
+    arg_ef = [-1] * len(graph.dep_lists)
     for i in order:
         t = tasks[i]
-        es = 0
-        for d in t.deps:
-            if ef[d] > es:
-                es, best_pred[i] = ef[d], d
-        ef[i] = es + t.dur
+        ef[i] = max_ef[t.dl] + t.dur
+        best_pred[i] = arg_ef[t.dl]
+        for li in graph.containing[i]:
+            if ef[i] > max_ef[li]:
+                max_ef[li], arg_ef[li] = ef[i], i
     cp_len = max(ef, default=0)
 
     # backward pass for slack (deadline = cp_len)
-    succs: list[list[int]] = [[] for _ in tasks]
-    for t in tasks:
-        for d in t.deps:
-            succs[d].append(t.id)
-    lf = [cp_len] * len(tasks)  # latest finish
+    lf = [cp_len] * n       # latest finish
+    min_ls = [cp_len] * len(graph.dep_lists)  # min latest-start over dl members
     for i in reversed(order):
-        for s in succs[i]:
-            lf[i] = min(lf[i], lf[s] - tasks[s].dur)
-    slack = [lf[i] - ef[i] for i in range(len(tasks))]
+        t = tasks[i]
+        low = cp_len
+        for li in graph.containing[i]:
+            if min_ls[li] < low:
+                low = min_ls[li]
+        lf[i] = low
+        if low - t.dur < min_ls[t.dl]:
+            min_ls[t.dl] = low - t.dur
+    slack = [lf[i] - ef[i] for i in range(n)]
 
-    end = max(range(len(tasks)), key=lambda i: ef[i], default=-1)
+    end = max(range(n), key=lambda i: ef[i], default=-1)
     path = []
     while end != -1:
         path.append(end)
@@ -484,17 +563,12 @@ def critical_path(tasks: list[Task], order: list[int]):
     return cp_len, list(reversed(path)), slack
 
 
-def simulate(tasks: list[Task], cores: float, tails: list[int]) -> int:
+def simulate(graph: TaskGraph, cores: float, tails: list[int]) -> int:
     """Greedy list scheduling (critical-path-first). Returns makespan in ms."""
-    indeg = [len(t.deps) for t in tasks]
-    succs: list[list[int]] = [[] for _ in tasks]
-    for t in tasks:
-        for d in t.deps:
-            succs[d].append(t.id)
-    ready = [(-tails[i], i) for i, d in enumerate(indeg) if d == 0]
-    ready.sort()
-    import heapq
-    heapq.heapify(ready)
+    tasks = graph.tasks
+    pending = list(graph.list_size)
+    ready = [(-tails[t.id], t.id) for t in tasks if pending[t.dl] == 0]
+    heapify(ready)
     running: list[tuple[int, int]] = []
     now = 0
     makespan = 0
@@ -512,22 +586,27 @@ def simulate(tasks: list[Task], cores: float, tails: list[int]) -> int:
         while running and running[0][0] == now:
             done.append(heappop(running)[1])
         for j in done:
-            for s in succs[j]:
-                indeg[s] -= 1
-                if indeg[s] == 0:
-                    heappush(ready, (-tails[s], s))
+            for li in graph.containing[j]:
+                pending[li] -= 1
+                if pending[li] == 0:
+                    for s in graph.tasks_with_dl[li]:
+                        heappush(ready, (-tails[s], s))
     return makespan
 
 
-def compute_tails(tasks: list[Task], order: list[int]) -> list[int]:
-    succs: list[list[int]] = [[] for _ in tasks]
-    for t in tasks:
-        for d in t.deps:
-            succs[d].append(t.id)
+def compute_tails(graph: TaskGraph, order: list[int]) -> list[int]:
+    tasks = graph.tasks
     tails = [0] * len(tasks)
+    tail_max = [0] * len(graph.dep_lists)  # max tail over tasks with dl == L
     for i in reversed(order):
-        longest = max((tails[s] for s in succs[i]), default=0)
-        tails[i] = tasks[i].dur + longest
+        t = tasks[i]
+        longest = 0
+        for li in graph.containing[i]:
+            if tail_max[li] > longest:
+                longest = tail_max[li]
+        tails[i] = t.dur + longest
+        if tails[i] > tail_max[t.dl]:
+            tail_max[t.dl] = tails[i]
     return tails
 
 
@@ -562,6 +641,14 @@ def build_report(builddir: Path, title: str | None, no_deps: bool,
     if not log_path.exists():
         sys.exit(f"error: {log_path} not found (run a build first)")
 
+    # the deps tool is an external process that only needs builddir, so it
+    # runs concurrently with the (pure-Python) manifest parse below
+    deps_future = None
+    deps_executor = None
+    if not no_deps:
+        deps_executor = ThreadPoolExecutor(max_workers=1)
+        deps_future = deps_executor.submit(run_deps_tool, builddir)
+
     manifest = NinjaManifest(builddir)
     manifest.parse(manifest_path)
     print(f"parsed {len(manifest.edges)} edges from build.ninja")
@@ -572,17 +659,21 @@ def build_report(builddir: Path, title: str | None, no_deps: bool,
               "timeline shows the most recent entry per output. For accurate "
               "results use a clean full build.", file=sys.stderr)
 
-    discovered = {} if no_deps else parse_deps_tool(builddir, manifest)
+    discovered = {}
+    if deps_future is not None:
+        discovered = parse_deps_output(deps_future.result(), manifest)
+        deps_executor.shutdown()
 
-    tasks, n_unlogged = build_tasks(manifest, log, discovered)
+    tasks, dep_lists, n_unlogged = build_tasks(manifest, log, discovered)
     if n_unlogged:
         print(f"warning: {n_unlogged} task(s) have no timing in .ninja_log "
               "(duration treated as 0)", file=sys.stderr)
     print(f"{len(tasks)} tasks with timing/dependency info")
 
-    order = topo_order(tasks)
-    cp_len, cp_path, slack = critical_path(tasks, order)
-    tails = compute_tails(tasks, order)
+    graph = TaskGraph(tasks, dep_lists)
+    order = topo_order(graph)
+    cp_len, cp_path, slack = critical_path(graph, order)
+    tails = compute_tails(graph, order)
 
     timed = [t for t in tasks if t.start is not None]
     wall = max((t.end for t in timed), default=0) - min((t.start for t in timed), default=0)
@@ -595,7 +686,14 @@ def build_report(builddir: Path, title: str | None, no_deps: bool,
         cur += delta
         peak = max(peak, cur)
 
-    speedup = [{"cores": n, "makespan": simulate(tasks, n, tails)} for n in CORE_OPTIONS]
+    # once a core count reaches the critical-path bound, higher counts can't
+    # improve — fill them in without simulating
+    speedup = []
+    makespan = None
+    for n in CORE_OPTIONS:
+        if makespan != cp_len:
+            makespan = simulate(graph, n, tails)
+        speedup.append({"cores": n, "makespan": makespan})
     speedup.append({"cores": None, "makespan": cp_len})  # infinite cores
 
     rules = sorted({t.edge.rule for t in tasks})
@@ -628,23 +726,16 @@ def build_report(builddir: Path, title: str | None, no_deps: bool,
     # tasks are emitted columnar, with dependency lists interned: whole groups
     # of tasks share identical dep sets (GN stamp fan-outs especially), and
     # materializing each copy is what makes naive exports quadratic-ish
-    dep_lists: list[list[int]] = []
-    dep_index: dict[tuple[int, ...], int] = {}
     cols: dict[str, list] = {k: [] for k in
                              ("name", "rule", "start", "end", "dur", "dl", "slack", "cp")}
     cmds: list[str | None] | None = None if no_commands else []
     for t in tasks:
-        key = tuple(sorted(t.deps))
-        di = dep_index.get(key)
-        if di is None:
-            di = dep_index[key] = len(dep_lists)
-            dep_lists.append(list(key))
         cols["name"].append(display_name(t))
         cols["rule"].append(rule_idx[t.edge.rule])
         cols["start"].append(t.start)
         cols["end"].append(t.end)
         cols["dur"].append(t.dur)
-        cols["dl"].append(di)
+        cols["dl"].append(t.dl)
         cols["slack"].append(slack[t.id])
         cols["cp"].append(1 if t.id in cp_set else 0)
         if cmds is not None:
@@ -661,7 +752,7 @@ def build_report(builddir: Path, title: str | None, no_deps: bool,
     return data, tasks, manifest
 
 
-def render_html(data: dict, compress: bool | None = None) -> str:
+def render_html(data: dict, compress: bool | None = None, level: int = 6) -> str:
     """Embed the data payload; compress it when it is large.
 
     compress=None (auto) deflates payloads over 1 MB — the page inflates them
@@ -672,10 +763,10 @@ def render_html(data: dict, compress: bool | None = None) -> str:
     if compress is None:
         compress = len(raw) > 1_000_000
     if compress:
-        z = base64.b64encode(zlib.compress(raw.encode("utf-8"), 9)).decode("ascii")
+        z = base64.b64encode(zlib.compress(raw.encode("utf-8"), level)).decode("ascii")
         payload = json.dumps({"z": z})
         print(f"payload        : {len(raw) / 1e6:.1f} MB JSON -> "
-              f"{len(z) / 1e6:.1f} MB compressed")
+              f"{len(z) / 1e6:.1f} MB compressed (zlib level {level})")
     else:
         payload = raw.replace("</", "<\\/")
     return template.replace("/*__NINJASCOPE_DATA__*/null", payload)
@@ -1011,6 +1102,10 @@ def main() -> None:
     ap.add_argument("--no-compress", action="store_true",
                     help="embed the data as plain JSON even when large "
                          "(readable/greppable report source)")
+    ap.add_argument("--compress-level", type=int, choices=range(0, 10),
+                    metavar="{0-9}", default=6,
+                    help="zlib level for the embedded payload (default 6; "
+                         "9 is smallest but slower; ignored with --no-compress)")
     ap.add_argument("--ignore-file", type=Path, default=None,
                     help="file of finding ids to suppress, one fnmatch-style "
                          "pattern per line, '#' comments (default: "
@@ -1037,7 +1132,8 @@ def main() -> None:
                     if ln.strip() and not ln.strip().startswith("#")]
         data["meta"]["ignore"] = patterns
         print(f"ignore list    : {len(patterns)} pattern(s) from {ignore_path}")
-    html = render_html(data, compress=False if args.no_compress else None)
+    html = render_html(data, compress=False if args.no_compress else None,
+                       level=args.compress_level)
 
     if args.interactive:
         serve(Bridge(builddir, html, tasks, manifest), args.port, not args.no_open)
