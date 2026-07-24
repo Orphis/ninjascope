@@ -284,10 +284,7 @@
       <button id="themeToggle" title="Toggle color theme">theme: auto</button>
     </div>
   </header>
-  <div class="banner" id="mixedBanner" style="display:none">
-    ⚠ The ninja log contains entries from multiple builds — the timeline shows the most
-    recent entry per output. For accurate results, run a clean full build.
-  </div>
+  <div class="banner" id="mixedBanner" style="display:none"></div>
 
   <div class="tabbar">
     <div class="tab active" data-view="overview">Overview</div>
@@ -924,16 +921,38 @@ class TimelineView {
 const M = DATA.meta;
 document.title = M.title;
 $("title").textContent = M.title;
-$("meta").textContent = `${M.builddir} · generated ${M.generated} · ${M.taskCount} tasks`;
-if (M.mixedLog) $("mixedBanner").style.display = "block";
+const nRuns = (M.runs || []).length;
+$("meta").textContent = `${M.builddir} · generated ${M.generated} · ${M.taskCount} tasks` +
+  (nRuns > 1 ? ` · run ${M.selectedRun}/${nRuns}` : "");
+if (M.recompacted) {
+  $("mixedBanner").innerHTML = "⚠ The ninja log has been recompacted — per-build run " +
+    "structure is lost, so no observed timeline is available. Durations are each " +
+    "task's most recent record; treat the analysis as approximate.";
+  $("mixedBanner").style.display = "block";
+} else if (nRuns > 1) {
+  const r = M.runs[M.selectedRun - 1] || {};
+  $("mixedBanner").innerHTML = `⚠ The ninja log contains ${nRuns} builds. The timeline ` +
+    `shows run ${M.selectedRun}/${nRuns}` + (r.date ? ` (${esc(r.date)})` : "") +
+    `; tasks not rebuilt in it appear as “not built”. Critical path, what-if and ` +
+    `insights use each task's most recent duration across all builds — treat them as ` +
+    `approximate. Rerun with <code>--list-runs</code> / <code>--run N</code> to pick ` +
+    `another build.`;
+  $("mixedBanner").style.display = "block";
+} else if (M.mixedLog) {
+  $("mixedBanner").textContent = "⚠ The ninja log mixes entries from multiple builds.";
+  $("mixedBanner").style.display = "block";
+}
 
+const hasWall = M.wall != null;
 const avgPar = M.work / Math.max(M.wall, 1);
 const maxSpeedup = M.work / Math.max(M.cpLength, 1);
 const tiles = [
-  [fmtMs(M.wall), "wall time", "as built"],
+  [fmtMs(M.wall), "wall time", nRuns > 1 ? "selected run" : "as built"],
   [fmtMs(M.work), "total work", "sum of all task durations"],
-  [fmtX(avgPar), "avg parallelism", `peak ${M.peakConcurrency} tasks at once`],
-  [fmtMs(M.cpLength), "critical path", (100 * M.cpLength / Math.max(M.wall, 1)).toFixed(0) + "% of wall time"],
+  [hasWall ? fmtX(avgPar) : "–", "avg parallelism", `peak ${M.peakConcurrency} tasks at once`],
+  [fmtMs(M.cpLength), "critical path",
+   hasWall ? (100 * M.cpLength / Math.max(M.wall, 1)).toFixed(0) + "% of wall time"
+           : "no timeline available"],
   [fmtX(maxSpeedup), "max speedup", "total work ÷ critical path"],
   [String(M.taskCount), "tasks", DATA.criticalPath.length + " on the critical path"],
 ];
@@ -972,8 +991,9 @@ function runSim() {
   const items = T.filter(t => t.dur > 0).map(t => ({ id: t.id, start: res.start[t.id], end: res.end[t.id] }));
   $("simCoresLabel").textContent = cores === Infinity ? "∞" : cores;
   $("simWall").textContent = fmtMs(res.makespan);
-  const ratio = M.wall / Math.max(res.makespan, 1);
-  $("simSpeedup").textContent = ratio >= 1 ? ratio.toFixed(2) + "× faster" : (1 / ratio).toFixed(2) + "× slower";
+  const ratio = M.wall != null ? M.wall / Math.max(res.makespan, 1) : null;
+  $("simSpeedup").textContent = ratio == null ? "–"
+    : ratio >= 1 ? ratio.toFixed(2) + "× faster" : (1 / ratio).toFixed(2) + "× slower";
   $("simUtil").textContent = cores === Infinity ? "–"
     : (100 * M.work / (cores * Math.max(res.makespan, 1))).toFixed(0) + "%";
   simView.highlightCp = $("cpToggle").checked;
@@ -1706,7 +1726,7 @@ function renderSpeedupChart() {
       },
       {
         name: "actual build", type: "scatter", symbolSize: 11,
-        data: [[Math.max(M.peakConcurrency, 1), M.wall]],
+        data: M.wall != null ? [[Math.max(M.peakConcurrency, 1), M.wall]] : [],
         itemStyle: { color: cssVar("--text-primary") },
       },
     ],
@@ -1749,7 +1769,11 @@ function locateTask(id) {
   actualView.focusTask(id); showDetail(id);
 }
 const shortName = n => n.split("/").pop();
-const wallMs = Math.max(M.wall, 1);
+// insight thresholds are fractions of "the build's duration". A full build's
+// wall time is always >= the critical path, so max() changes nothing there;
+// for an incremental run or a recompacted log (wall small or null) the
+// synthesized critical-path length is the honest stand-in.
+const wallMs = Math.max(M.wall != null ? M.wall : 0, M.cpLength, 1);
 
 // longest path with one task's duration zeroed: the exact wall-time floor if
 // that task were free. Only CP tasks can gain (zeroing off-CP tasks changes

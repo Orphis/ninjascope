@@ -53,10 +53,12 @@ compare the critical paths and the speedup curves instead.)
 Works on any Ninja build directory (CMake, GN, Meson, …), not just the sample.
 `uv run ninjascope.py …` also works (PEP 723 metadata, stdlib-only).
 
-Options: `-o out.html`, `--title "…"`, `--no-deps` (skip `ninja -t deps`),
+Options: `-o out.html`, `--title "…"`, `--no-deps` (skip discovered dependencies),
+`--list-runs` / `--run N` (pick which build from a multi-build log to show on the
+timeline; default is the last one),
 `--no-commands` (omit per-task command lines),
 `--no-compress` (payloads over 1 MB are deflate-compressed automatically; this keeps
-the embedded JSON readable instead),
+the embedded JSON readable instead), `--compress-level {0-9}`,
 `--ignore-file` (suppress Insights findings by id, one fnmatch pattern per line;
 `<builddir>/.ninjascope-ignore` is picked up automatically).
 
@@ -138,8 +140,16 @@ The project configures into two flavors of the same graph, switched by
 
 ## Accuracy notes
 
-- `.ninja_log` is append-only across builds; after incremental rebuilds the
-  timeline mixes runs and the tool (and the report) warn. Use a clean build.
+- `.ninja_log` is append-only across builds. NinjaScope splits it into per-build
+  runs: the timeline shows one run (the last by default; `--run N` to pick,
+  `--list-runs` to inspect), with tasks not rebuilt in it shown as "not built".
+  The critical path / what-if / Insights always use each task's most recent
+  recorded duration across all runs, so they cover the whole build even from an
+  incremental log — durations sampled under different conditions (load, warm
+  caches) make them approximate, and the report says so. A clean full build is
+  still the gold standard.
+- If ninja has recompacted the log (`ninja -t recompact`, or automatically on
+  large logs), run structure is unrecoverable: no timeline, analysis only.
 - Tasks present in the manifest but never built get duration 0.
 - The simulator assumes task durations don't change with the core count — no
   memory-bandwidth/IO contention modeling — so low-core predictions are

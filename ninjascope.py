@@ -312,10 +312,53 @@ class NinjaManifest:
 # .ninja_log parsing
 # --------------------------------------------------------------------------
 
+@dataclass
+class LogRun:
+    """One ninja invocation's worth of .ninja_log entries."""
+    tasks: dict[str, tuple[int, int]]  # output key -> (start_ms, end_ms)
+    mtime: int = 0                     # first entry's mtime (raw log units)
+
+    def wall(self) -> int:
+        if not self.tasks:
+            return 0
+        return (max(e for _, e in self.tasks.values())
+                - min(s for s, _ in self.tasks.values()))
+
+    def date(self) -> str | None:
+        """Best-effort absolute date from the mtime field (ns in current
+        ninja, seconds in old versions)."""
+        v = self.mtime
+        if v > 10**11:
+            v //= 10**9
+        if v <= 0:
+            return None
+        try:
+            return datetime.fromtimestamp(v).isoformat(timespec="seconds")
+        except (OverflowError, OSError, ValueError):
+            return None
+
+
 def parse_ninja_log(path: Path, manifest: NinjaManifest):
-    """Return ({output_key: (start_ms, end_ms)}, mixed_runs: bool)."""
-    entries: dict[str, tuple[int, int]] = {}
-    mixed = False
+    """Parse .ninja_log into per-invocation runs plus latest durations.
+
+    start/end times are milliseconds relative to each ninja invocation's
+    start, and entries are appended in completion order — so end times are
+    non-decreasing within one run, and a drop marks the next invocation.
+
+    Returns (runs, latest, recompacted):
+      runs         chronological list of LogRun (empty if structure unusable)
+      latest       {output_key: dur_ms} from each output's last entry
+      recompacted  True when the log looks recompacted (at most one entry per
+                   output, rewritten in arbitrary order): durations are still
+                   usable, run structure and timelines are not
+    """
+    norm = manifest.norm
+    runs: list[LogRun] = []
+    cur: dict[str, tuple[int, int]] = {}
+    cur_mtime = 0
+    latest: dict[str, int] = {}
+    seen_repeat = False
+    prev_end = -1
     with path.open(encoding="utf-8", errors="replace") as f:
         header = f.readline()
         if not header.startswith("# ninja log v"):
@@ -328,12 +371,33 @@ def parse_ninja_log(path: Path, manifest: NinjaManifest):
             fields = line.rstrip("\n").split("\t")
             if len(fields) < 5:
                 continue
-            key = manifest.norm(fields[3])
-            times = (int(fields[0]), int(fields[1]))
-            if key in entries and entries[key] != times:
-                mixed = True
-            entries[key] = times
-    return entries, mixed
+            try:
+                start, end = int(fields[0]), int(fields[1])
+            except ValueError:
+                continue
+            if end < prev_end and cur:
+                runs.append(LogRun(cur, cur_mtime))
+                cur = {}
+            if not cur:
+                try:
+                    cur_mtime = int(fields[2])
+                except ValueError:
+                    cur_mtime = 0
+            prev_end = end
+            key = norm(fields[3])
+            if key in latest:
+                seen_repeat = True
+            cur[key] = (start, end)
+            latest[key] = max(0, end - start)
+    if cur:
+        runs.append(LogRun(cur, cur_mtime))
+    # Recompaction rewrites the log with one entry per output in arbitrary
+    # order, which the segmentation above shreds into many tiny "runs". A
+    # genuine multi-run history rebuilds at least one output twice.
+    recompacted = len(runs) > 4 and not seen_repeat
+    if recompacted:
+        runs = []
+    return runs, latest, recompacted
 
 
 # --------------------------------------------------------------------------
@@ -444,8 +508,11 @@ class Task:
     dl: int = 0  # index into the shared dep-lists table
 
 
-def build_tasks(manifest: NinjaManifest, log: dict[str, tuple[int, int]],
-                discovered: dict[str, list[str]]):
+def build_tasks(manifest: NinjaManifest, timing: dict[str, tuple[int, int]],
+                durations: dict[str, int], discovered: dict[str, list[str]]):
+    """Build the task list: `timing` holds start/end for the run shown on the
+    timeline; `durations` holds every output's most recent duration and
+    decides which edges count as built (plus their transitive deps)."""
     edge_by_output: dict[str, int] = {}
     for idx, e in enumerate(manifest.edges):
         for o in e.outputs:
@@ -540,7 +607,7 @@ def build_tasks(manifest: NinjaManifest, log: dict[str, tuple[int, int]],
     # keep edges that were built (in the log) plus anything they depend on;
     # a shared dep set only needs expanding once, not per referencing edge
     logged = {idx for idx, e in enumerate(manifest.edges)
-              if e.rule != "phony" and any(o in log for o in e.outputs)}
+              if e.rule != "phony" and any(o in durations for o in e.outputs)}
     keep: set[int] = set()
     expanded: set[int] = set()
     frontier = list(logged)
@@ -574,10 +641,17 @@ def build_tasks(manifest: NinjaManifest, log: dict[str, tuple[int, int]],
             dep_lists.append(sorted(task_id[d] for d in eds))
         t = Task(id=task_id[edge_idx], edge=e, dl=di)
         for o in e.outputs:
-            if o in log:
-                t.start, t.end = log[o]
+            if o in timing:
+                # built in the displayed run: timeline bar and duration agree
+                t.start, t.end = timing[o]
                 t.dur = max(0, t.end - t.start)
                 break
+        else:
+            for o in e.outputs:
+                if o in durations:
+                    # not in the displayed run: latest known duration, no bar
+                    t.dur = durations[o]
+                    break
         tasks.append(t)
     return tasks, dep_lists, len(unlogged_kept)
 
@@ -730,8 +804,14 @@ def classify_rule(rule: str) -> str:
 # --------------------------------------------------------------------------
 
 def build_report(builddir: Path, title: str | None, no_deps: bool,
-                 no_commands: bool = False):
-    """Parse the build dir; return (data dict for the template, tasks, manifest)."""
+                 no_commands: bool = False, run: int | None = None):
+    """Parse the build dir; return (data dict for the template, tasks, manifest).
+
+    `run` is a 1-based index into the builds detected in .ninja_log (see
+    --list-runs); None shows the last build on the timeline. Task durations
+    always come from each output's most recent log entry, so the critical
+    path / what-if analysis covers the whole DAG even for incremental runs.
+    """
     manifest_path = builddir / "build.ninja"
     log_path = builddir / ".ninja_log"
     if not manifest_path.exists():
@@ -756,11 +836,30 @@ def build_report(builddir: Path, title: str | None, no_deps: bool,
     manifest.parse(manifest_path)
     print(f"parsed {len(manifest.edges)} edges from build.ninja")
 
-    log, mixed = parse_ninja_log(log_path, manifest)
-    if mixed:
-        print("warning: .ninja_log contains entries from multiple builds; the "
-              "timeline shows the most recent entry per output. For accurate "
-              "results use a clean full build.", file=sys.stderr)
+    runs, latest, recompacted = parse_ninja_log(log_path, manifest)
+    sel_idx = None
+    timing: dict[str, tuple[int, int]] = {}
+    if runs:
+        sel_idx = (run - 1) if run is not None else len(runs) - 1
+        if not 0 <= sel_idx < len(runs):
+            sys.exit(f"error: --run {run} out of range; the log contains "
+                     f"{len(runs)} run(s) (see --list-runs)")
+        timing = runs[sel_idx].tasks
+    elif run is not None:
+        sys.exit("error: --run given but the log has no usable run structure "
+                 "(recompacted?)")
+    if recompacted:
+        print("warning: .ninja_log has been recompacted — per-build run "
+              "structure is lost, so no observed timeline is available; "
+              "analysis uses each output's most recent duration.",
+              file=sys.stderr)
+    elif len(runs) > 1:
+        r = runs[sel_idx]
+        when = r.date() or "unknown date"
+        print(f".ninja_log contains {len(runs)} builds; timeline shows run "
+              f"{sel_idx + 1}/{len(runs)} ({when}, {len(r.tasks)} tasks, wall "
+              f"{r.wall() / 1000:.1f}s). Analysis uses each output's most "
+              "recent duration across all builds.")
 
     discovered = {}
     if use_binary_deps:
@@ -771,7 +870,7 @@ def build_report(builddir: Path, title: str | None, no_deps: bool,
         discovered = parse_deps_output(deps_future.result(), manifest)
         deps_executor.shutdown()
 
-    tasks, dep_lists, n_unlogged = build_tasks(manifest, log, discovered)
+    tasks, dep_lists, n_unlogged = build_tasks(manifest, timing, latest, discovered)
     if n_unlogged:
         print(f"warning: {n_unlogged} task(s) have no timing in .ninja_log "
               "(duration treated as 0)", file=sys.stderr)
@@ -783,7 +882,8 @@ def build_report(builddir: Path, title: str | None, no_deps: bool,
     tails = compute_tails(graph, order)
 
     timed = [t for t in tasks if t.start is not None]
-    wall = max((t.end for t in timed), default=0) - min((t.start for t in timed), default=0)
+    wall = (max(t.end for t in timed) - min(t.start for t in timed)
+            if timed else None)
     work = sum(t.dur for t in tasks)
 
     # observed peak concurrency
@@ -824,7 +924,11 @@ def build_report(builddir: Path, title: str | None, no_deps: bool,
             "cpLength": cp_len,
             "peakConcurrency": peak,
             "taskCount": len(tasks),
-            "mixedLog": mixed,
+            "mixedLog": len(runs) > 1 or recompacted,
+            "recompacted": recompacted,
+            "selectedRun": None if sel_idx is None else sel_idx + 1,
+            "runs": [{"tasks": len(r.tasks), "wall": r.wall(), "date": r.date()}
+                     for r in runs],
             "speedup": speedup,
         },
         "rules": [{"name": r, "kind": classify_rule(r)} for r in rules],
@@ -852,8 +956,12 @@ def build_report(builddir: Path, title: str | None, no_deps: bool,
     data["tasksCols"] = cols
     data["depLists"] = dep_lists
 
-    print(f"wall time      : {wall / 1000:.1f}s")
-    print(f"total work     : {work / 1000:.1f}s  (avg parallelism {work / max(wall, 1):.1f}x)")
+    if wall is not None:
+        print(f"wall time      : {wall / 1000:.1f}s")
+        print(f"total work     : {work / 1000:.1f}s  "
+              f"(avg parallelism {work / max(wall, 1):.1f}x)")
+    else:
+        print(f"total work     : {work / 1000:.1f}s  (no timeline available)")
     print(f"critical path  : {cp_len / 1000:.1f}s  ({len(cp_path)} tasks, "
           f"max speedup {work / max(cp_len, 1):.1f}x)")
     return data, tasks, manifest
@@ -1203,6 +1311,12 @@ def main() -> None:
     ap.add_argument("--title", default=None, help="report title")
     ap.add_argument("--no-deps", action="store_true",
                     help="skip `ninja -t deps` (generated-header dependencies)")
+    ap.add_argument("--run", type=int, default=None, metavar="N",
+                    help="which build from .ninja_log to show on the timeline, "
+                         "1-based (default: the last one; see --list-runs). "
+                         "Analysis always uses each task's most recent duration")
+    ap.add_argument("--list-runs", action="store_true",
+                    help="list the builds detected in .ninja_log and exit")
     ap.add_argument("--no-commands", action="store_true",
                     help="omit per-task command lines from the report "
                          "(smaller output for very large builds)")
@@ -1227,8 +1341,26 @@ def main() -> None:
     args = ap.parse_args()
 
     builddir: Path = args.builddir.resolve()
+
+    if args.list_runs:
+        log_path = builddir / ".ninja_log"
+        if not log_path.exists():
+            sys.exit(f"error: {log_path} not found (run a build first)")
+        # norm() only needs builddir, so no manifest parse is required here
+        runs, latest, recompacted = parse_ninja_log(log_path, NinjaManifest(builddir))
+        if recompacted:
+            print(f"log has been recompacted: {len(latest)} outputs with "
+                  "durations, no per-build run structure")
+        elif not runs:
+            print("no entries in .ninja_log")
+        for i, r in enumerate(runs):
+            marker = "  (default)" if i == len(runs) - 1 else ""
+            print(f"run {i + 1:3d}: {r.date() or 'unknown date':>19}  "
+                  f"{len(r.tasks):6d} tasks  wall {r.wall() / 1000:8.1f}s{marker}")
+        return
+
     data, tasks, manifest = build_report(builddir, args.title, args.no_deps,
-                                         args.no_commands)
+                                         args.no_commands, args.run)
 
     ignore_path = args.ignore_file or builddir / ".ninjascope-ignore"
     if args.ignore_file and not ignore_path.is_file():
