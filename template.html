@@ -443,6 +443,7 @@
         <span class="chip"><span class="sw" data-kind="link"></span>executable</span>
         <span class="chip"><span class="sw" data-kind="codegen"></span>generated</span>
         <span class="chip"><span class="sw" data-kind="other"></span>group</span>
+        <span class="chip"><span class="sw" style="background:linear-gradient(to top right, transparent 50%, var(--critical) 50%)"></span>has insights</span>
         <label><input type="checkbox" id="tredToggle"> hide transitive edges</label>
         <label><input type="checkbox" id="allEdgesToggle"> draw all edges</label>
         <span class="hint">wheel = zoom · drag = pan · click = select · double-click = fit</span>
@@ -461,6 +462,7 @@
           <button id="tdClose" title="Close">×</button>
         </div>
         <div class="detail-info" id="tdInfo"></div>
+        <div id="tdInsightsWrap" style="display:none"><h3>insights</h3><div class="dep-list" id="tdInsights"></div></div>
         <div class="detail-links">
           <div><h3>depends on</h3><div class="dep-list" id="tdDeps"></div></div>
           <div><h3>dependents</h3><div class="dep-list" id="tdRdeps"></div></div>
@@ -1661,15 +1663,28 @@ class GraphView {
         g.strokeStyle = primaryInk(1); g.lineWidth = 1.6;
         g.strokeRect(x + 0.8, y + 0.8, w - 1.6, h - 1.6);
       }
+      // warning corner: this target has insights attached (coarse deps,
+      // serialization, slow TUs) — details in the tooltip and target detail
+      const warn = targetFindings && targetFindings[id].length && w >= 14 && h >= 12
+        ? Math.min(11, h - 3, w / 2) : 0;
+      if (warn) {
+        g.beginPath();
+        g.moveTo(x + w - 1 - warn, y + 1); g.lineTo(x + w - 1, y + 1);
+        g.lineTo(x + w - 1, y + 1 + warn);
+        g.closePath();
+        g.fillStyle = critical;
+        g.fill();
+      }
       if (w >= 64 && h >= 13) {
         g.save();
         g.beginPath(); g.rect(x + 4, y, w - 8, h); g.clip();
         g.fillStyle = ink[t.kind] || "#ffffff";
         const showBadge = w >= 130;
         const badge = "‹" + this.depsOf(id).length + " ›" + this.rdepsOf(id).length;
-        // room for the ‹deps ›dependents badge: ~6.3px/char name, ~5.5px/char badge
+        // room for the ‹deps ›dependents badge: ~6.3px/char name, ~5.5px/char
+        // badge — the warning corner pushes right-aligned content left
         const cap = showBadge
-          ? Math.max(8, Math.floor((w - 18 - 5.5 * badge.length) / 6.3)) : 26;
+          ? Math.max(8, Math.floor((w - 18 - warn - 5.5 * badge.length) / 6.3)) : 26;
         const nm = t.name.length > cap ? "…" + t.name.slice(-(cap - 1)) : t.name;
         const nameY = h >= 32 ? y + h / 2 - 8 : y + h / 2 + 0.5;
         g.font = (h >= 32 ? "600 11.5px" : "600 10.5px") + " system-ui, sans-serif";
@@ -1677,7 +1692,7 @@ class GraphView {
         if (showBadge) {
           g.textAlign = "right";
           g.font = "9.5px system-ui, sans-serif";
-          g.fillText(badge, x + w - 6, nameY);
+          g.fillText(badge, x + w - 6 - (nameY < y + 1 + warn + 5 ? warn : 0), nameY);
           g.textAlign = "left";
         }
         if (h >= 32) {
@@ -1763,7 +1778,9 @@ class GraphView {
         `<div class="trow">total build time ${fmtMs(t.selfMs, true)} across ${t.count} task${t.count === 1 ? "" : "s"}</div>` +
         (t.start != null ? `<div class="trow">active ${fmtMs(t.start)} → ${fmtMs(t.end)}</div>` : "") +
         `<div class="trow">${t.deps.length} dependencies · ${t.rdeps.length} dependents` +
-        `${t.cp ? ' · <span class="cpbadge">on critical path</span>' : ""}</div>`;
+        `${t.cp ? ' · <span class="cpbadge">on critical path</span>' : ""}</div>` +
+        (targetFindings && targetFindings[id].length
+          ? `<div class="trow"><span class="cpbadge">⚠ ${targetFindings[id].length} insight${targetFindings[id].length > 1 ? "s" : ""}</span> — click the target for details</div>` : "");
       tip.style.display = "block";
       tip.style.left = Math.min(e.clientX + 14, innerWidth - tip.offsetWidth - 8) + "px";
       tip.style.top = Math.min(e.clientY + 14, innerHeight - tip.offsetHeight - 8) + "px";
@@ -2041,6 +2058,14 @@ function showTarget(id) {
     [t.cp ? "yes" : "no", "critical path"],
     ...(t.dir ? [[esc(t.dir), "directory"]] : []),
   ].map(([v, l]) => `<div><b>${v}</b>${l}</div>`).join("");
+  const fi = targetFindings ? targetFindings[id] : [];
+  $("tdInsightsWrap").style.display = fi.length ? "" : "none";
+  if (fi.length) $("tdInsights").innerHTML = fi.map(i => {
+    const f = FIND[i];
+    return `<div class="dep-row" data-fi="${i}" title="id: ${esc(f.fid)} — click to open in Insights">` +
+      `<span class="sev" style="background:${sevColor[f.sev]};flex:none"></span>` +
+      `<span>${f.title} · <span style="color:var(--text-muted)">${f.evidence}</span></span></div>`;
+  }).join("");
   renderTargetList($("tdDeps"), t.deps, "nothing — a root of the graph");
   renderTargetList($("tdRdeps"), t.rdeps, "nothing — a terminal target");
   renderDepList($("tdTasks"), t.tasks, "no tasks");
@@ -2071,6 +2096,10 @@ if (TG) {
   $("tdTasks").addEventListener("click", e => {
     const row = e.target.closest(".dep-row[data-id]");
     if (row) locateTask(+row.dataset.id);
+  });
+  $("tdInsights").addEventListener("click", e => {
+    const row = e.target.closest(".dep-row[data-fi]");
+    if (row) revealFinding(+row.dataset.fi);
   });
   $("tredToggle").addEventListener("change", e => {
     if (e.target.checked && !graphView.computeReduction()) {
@@ -3459,6 +3488,37 @@ const SEV_RANK = { high: 0, med: 1, low: 2 };
 findings.sort((a, b) => SEV_RANK[a.sev] - SEV_RANK[b.sev]);
 const FIND = findings.concat(collapsedCoarse); // one index space for explain/prompt
 const sevColor = { high: "var(--critical)", med: "var(--kind-archive)", low: "var(--text-muted)" };
+
+// findings anchored to a task attach to that task's target, driving the ⚠
+// corner in the target graph and the insights list in the target detail.
+// Aggregate findings (blast radius) and machine-level ones (core starvation)
+// stay global-only.
+const targetFindings = TG ? TG.map(() => []) : null;
+if (targetFindings) {
+  const tt = DATA.tasksCols.target;
+  FIND.forEach((f, i) => {
+    if (f.id == null || f.type === "starved") return;
+    const g = tt[f.id];
+    if (g != null && g >= 0) targetFindings[g].push(i);
+  });
+  for (const l of targetFindings)
+    l.sort((a, b) => SEV_RANK[FIND[a].sev] - SEV_RANK[FIND[b].sev]);
+}
+// jump from a target's insight row to the full finding: switch tabs, expand
+// the collapsed coarse group if needed, open the explanation, and flash it
+function revealFinding(i) {
+  go("insights");
+  const btn = $("findingsTable").querySelector(`.x-btn[data-x="${i}"]`);
+  if (!btn) return;
+  const tr = btn.closest("tr");
+  if (tr.style.display === "none") $("findingsTable").querySelector(".x-more td")?.click();
+  const next = tr.nextElementSibling;
+  if (!(next && next.classList.contains("x-tr"))) btn.click();
+  tr.scrollIntoView({ block: "center" });
+  tr.style.transition = "background .4s";
+  tr.style.background = "color-mix(in srgb, var(--critical) 15%, transparent)";
+  setTimeout(() => { tr.style.background = ""; }, 1500);
+}
 const findingRow = (f, i, hidden) =>
   `<tr class="${hidden ? "x-hidden" : ""}"${hidden ? ' style="display:none"' : ""} ` +
   `${f.ids ? `data-ids="${f.ids.join(",")}"` : `data-id="${f.id}"`} ` +
@@ -3686,7 +3746,8 @@ paintSwatches();
 renderSpeedupChart();
 
 // console/automation handle for debugging reports in devtools
-window.__ninjascope = { DATA, T, TG, go, graphView, treemapView, showTarget, locateTask };
+window.__ninjascope = { DATA, T, TG, go, graphView, treemapView, showTarget, locateTask,
+                        FIND, targetFindings, revealFinding };
 
 } // bootReport
 </script>

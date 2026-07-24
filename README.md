@@ -199,14 +199,18 @@ fully static — the profiling UI simply never appears.
 - **Targets** — a layered dependency graph of the *targets* (libraries,
   executables) inferred from the Ninja graph: CMake object directories and
   rule names, GN's per-target `.ninja` files, archive/link steps as anchors
-  elsewhere; generated code forms its own targets grouped by output
+  elsewhere. Generated code follows its CMake `add_custom_target()` when one
+  exists and keeps its name; a generated source attached to a library joins
+  that library; remaining codegen forms its own targets per output
   directory, so codegen chains stay visible. Node
   height tracks total build time; `‹N ›M` badges show dependency/dependent
-  counts. Edges are drawn only for the hovered or selected target, so hub
-  libraries with hundreds of dependents stay readable; selecting a target
-  opens a panel with its dependencies, dependents, and tasks, and lights its
-  tasks up in the timeline. Toggles: hide transitive edges, draw all edges
-  (small graphs only).
+  counts, and a red corner marks targets with insights attached (coarse
+  dependencies, serialization points, slow TUs). Edges are drawn only for
+  the hovered or selected target, so hub libraries with hundreds of
+  dependents stay readable; selecting a target opens a panel with its
+  insights, dependencies, dependents, and tasks, and lights its tasks up in
+  the timeline. Toggles: hide transitive edges, draw all edges (small graphs
+  only).
 - **Treemap** — where the minutes go: box area is total build time,
   directories contain targets, targets contain their tasks. Click to zoom in,
   breadcrumb (or right-click) to zoom out; clicking a task opens it in the
