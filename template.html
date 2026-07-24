@@ -1437,6 +1437,7 @@ function go(view) {
   } else if (view === "treemap") {
     if (treemapView) treemapView.ensure();
   }
+  queueSync();
 }
 document.querySelectorAll(".tab").forEach(t => t.addEventListener("click", () => go(t.dataset.view)));
 
@@ -1922,6 +1923,7 @@ class TreemapView {
     }
     g.textBaseline = "alphabetic";
     this._crumbs();
+    queueSync();
   }
 
   _drawTile(g, tl, top) {
@@ -2071,6 +2073,7 @@ function showTarget(id) {
   renderDepList($("tdTasks"), t.tasks, "no tasks");
   highlightIdSet(new Set(t.tasks)); // light this target up in the timelines
   graphView.render();
+  queueSync();
 }
 
 function closeTargetDetail() {
@@ -2078,6 +2081,7 @@ function closeTargetDetail() {
   $("targetDetailSection").style.display = "none";
   if (graphView) { graphView.selected = null; graphView.render(); }
   highlightIdSet(null);
+  queueSync();
 }
 
 function toggleTarget(id) {
@@ -2155,14 +2159,10 @@ if (TG) {
 const searchBox = $("searchBox"), searchResults = $("searchResults");
 let searchTop = [], searchSel = 0, sugList = [], searchSpan = null;
 
-let hashTimer = null;
-function syncHash(raw) { // debounced: no history spam while typing
-  clearTimeout(hashTimer);
-  hashTimer = setTimeout(() => {
-    const q = raw.trim();
-    history.replaceState(null, "",
-      q.length >= 2 ? "#q=" + encodeURIComponent(q) : location.pathname + location.search);
-  }, 300);
+let searchHashTimer = null;
+function syncHash() { // debounced + replaceState: no history spam while typing
+  clearTimeout(searchHashTimer);
+  searchHashTimer = setTimeout(() => writeHash(true), 300);
 }
 
 // -------- filter autocompletion (keys, and values of enumerable keys) --------
@@ -2420,18 +2420,96 @@ document.addEventListener("keydown", e => {
     searchBox.focus(); searchBox.select();
   }
 });
-// restore a #q=… query from a shared link (filter applies, list stays closed);
-// hashchange covers pasting a #q into the address bar of an open report
-function restoreHashQuery() {
-  if (!location.hash.startsWith("#q=")) return;
-  try {
-    searchBox.value = decodeURIComponent(location.hash.slice(3));
-    applySearch(searchBox.value);
-    searchResults.style.display = "none";
-  } catch {}
+// ------------------------------------------------- history / deep links ---
+// The UI state that matters for navigation — active tab, selected target,
+// selected task, treemap path — lives in the URL hash. Every change pushes a
+// history entry, so back/forward walk the visited views, and the address bar
+// is always a shareable anchor into this report. Legacy #q=… search links
+// keep working. State writes coalesce per action (a task jump = tab switch +
+// selection = one entry) via a 0ms timer in queueSync.
+const DEFAULT_VIEW = document.querySelector(".view.active").id.slice(5);
+let lastWrittenHash = null;
+let navTimer = null;
+function currentHash() {
+  const parts = ["view=" + (document.querySelector(".view.active")?.id.slice(5) || DEFAULT_VIEW)];
+  if (selectedTargetId != null) parts.push("target=" + selectedTargetId);
+  if (selectedTask != null) parts.push("task=" + selectedTask);
+  if (treemapView && treemapView.ready && treemapView.stack.length > 1)
+    parts.push("tm=" + encodeURIComponent(treemapView.stack.slice(1)
+      .map(n => n.kind === "target" ? "t" + n.target : "d" + n.name).join("|")));
+  const q = searchBox.value.trim();
+  if (q.length >= 2) parts.push("q=" + encodeURIComponent(q));
+  return "#" + parts.join("&");
 }
-restoreHashQuery();
-addEventListener("hashchange", restoreHashQuery);
+function writeHash(replace) {
+  const h = currentHash();
+  if (location.hash === h) return;
+  if (replace) history.replaceState(null, "", h);
+  else { lastWrittenHash = h; location.hash = h; }
+}
+function queueSync() {
+  if (navTimer != null) return;
+  navTimer = setTimeout(() => { navTimer = null; writeHash(false); }, 0);
+}
+function applyHash() {
+  const p = new URLSearchParams(location.hash.slice(1));
+  if (p.has("q")) { // shared-search links, and the q token of pushed states
+    try {
+      searchBox.value = p.get("q");
+      applySearch(searchBox.value);
+      searchResults.style.display = "none";
+    } catch {}
+    if (!p.has("view")) return; // legacy pure-#q link
+  } else if (searchBox.value) {
+    searchBox.value = "";
+    applySearch("");
+  }
+  let view = p.get("view") || DEFAULT_VIEW;
+  if (!document.getElementById("view-" + view)
+      || (!TG && (view === "targets" || view === "treemap"))) view = DEFAULT_VIEW;
+  const tgt = TG && p.has("target") && TG[+p.get("target")] ? +p.get("target") : null;
+  const task = p.has("task") && T[+p.get("task")] ? +p.get("task") : null;
+  // clear what the hash doesn't carry first, then set what it does, so the
+  // close handlers' highlight resets can't wipe a freshly applied selection
+  if (task == null && selectedTask != null) closeDetail();
+  if (tgt == null && selectedTargetId != null) closeTargetDetail();
+  go(view);
+  if (tgt != null) {
+    showTarget(tgt);
+    if (view === "targets") graphView.focusTarget(tgt);
+  }
+  if (task != null) {
+    if (view === "timeline") actualView.focusTask(task);
+    showDetail(task);
+  }
+  if (treemapView) {
+    const tm = p.get("tm");
+    if (tm || (treemapView.ready && treemapView.stack.length > 1)) {
+      treemapView.ensure(); // builds the tree even while the tab is hidden
+      const stack = [treemapView.root];
+      if (tm) for (const comp of tm.split("|")) {
+        const cur = stack[stack.length - 1];
+        const kids = cur.kind === "target" ? targetChildren(cur) : cur.children;
+        const next = (kids || []).find(n => comp[0] === "t"
+          ? n.kind === "target" && n.target === +comp.slice(1)
+          : n.kind === "dir" && n.name === comp.slice(1));
+        if (!next) break;
+        stack.push(next);
+      }
+      treemapView.stack = stack;
+      treemapView.hover = null;
+      treemapView.render();
+    }
+  }
+  // canonicalize a partial/legacy hash by replacing, never pushing — a push
+  // here would truncate the forward entries mid back/forward navigation
+  clearTimeout(navTimer); navTimer = null;
+  writeHash(true);
+}
+addEventListener("hashchange", () => {
+  if (location.hash === lastWrittenHash) { lastWrittenHash = null; return; } // our own write
+  applyHash();
+});
 
 // ------------------------------------------- bridge (interactive mode) ---
 // The same page is served either as a static file or by `ninjascope.py
@@ -2470,6 +2548,7 @@ function closeDetail() {
   setDetailMax(false);
   selectedTask = null;
   setPathHighlight(null);
+  queueSync();
 }
 
 // timeline clicks toggle: clicking the selected task again deselects it
@@ -2558,6 +2637,7 @@ function showDetail(id) {
   } else {
     act.innerHTML = `<span>run <code>ninjascope.py ${esc(M.builddir)} --interactive</code> to enable compiler profiling</span>`;
   }
+  queueSync();
 }
 $("detailClose").addEventListener("click", closeDetail);
 for (const listId of ["detailDeps", "detailRdeps"]) {
@@ -3746,8 +3826,12 @@ paintSwatches();
 renderSpeedupChart();
 
 // console/automation handle for debugging reports in devtools
+// realize a deep link once everything the hash can reference exists; a plain
+// load stays hashless until the first navigation writes one
+if (location.hash) applyHash();
+
 window.__ninjascope = { DATA, T, TG, go, graphView, treemapView, showTarget, locateTask,
-                        FIND, targetFindings, revealFinding };
+                        FIND, targetFindings, revealFinding, applyHash, currentHash };
 
 } // bootReport
 </script>

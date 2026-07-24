@@ -216,6 +216,11 @@ fully static — the profiling UI simply never appears.
   breadcrumb (or right-click) to zoom out; clicking a task opens it in the
   timeline. Both tabs appear only when targets could be inferred.
 
+Navigation state — active tab, selected target or task, treemap path,
+search query — lives in the URL hash, so the browser's back/forward
+buttons walk your steps through the report and the address bar is always a
+shareable anchor into the current view.
+
 Sanity properties you can check live: at 1 core the prediction equals total
 work; at ∞ cores it equals the critical path; at the actual core count it
 should be within a few percent of the measured wall time.
