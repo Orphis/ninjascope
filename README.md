@@ -104,6 +104,21 @@ fully static — the profiling UI simply never appears.
   knee is where adding cores stops paying.
 - **Critical path** — length, task list with per-task share; click a row to
   zoom to that task in the timeline.
+- **Targets** — a layered dependency graph of the *targets* (libraries,
+  executables) inferred from the Ninja graph: CMake object directories and
+  rule names, GN's per-target `.ninja` files, archive/link steps as anchors
+  elsewhere; generated code forms its own targets grouped by output
+  directory, so codegen chains stay visible. Node
+  height tracks total build time; `‹N ›M` badges show dependency/dependent
+  counts. Edges are drawn only for the hovered or selected target, so hub
+  libraries with hundreds of dependents stay readable; selecting a target
+  opens a panel with its dependencies, dependents, and tasks, and lights its
+  tasks up in the timeline. Toggles: hide transitive edges, draw all edges
+  (small graphs only).
+- **Treemap** — where the minutes go: box area is total build time,
+  directories contain targets, targets contain their tasks. Click to zoom in,
+  breadcrumb (or right-click) to zoom out; clicking a task opens it in the
+  timeline. Both tabs appear only when targets could be inferred.
 
 Sanity properties you can check live: at 1 core the prediction equals total
 work; at ∞ cores it equals the critical path; at the actual core count it

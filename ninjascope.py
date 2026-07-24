@@ -59,6 +59,7 @@ class Edge:
     raw_out: list[str] = field(default_factory=list)   # explicit outputs as written ($out)
     raw_in: list[str] = field(default_factory=list)    # explicit inputs as written ($in)
     bindings: dict[str, str] = field(default_factory=dict)  # edge vars, unexpanded
+    src: int = 0                                        # index into NinjaManifest.files
 
 
 class NinjaManifest:
@@ -67,6 +68,8 @@ class NinjaManifest:
         self.scope: dict[str, str] = {}
         self.edges: list[Edge] = []
         self.rule_bindings: dict[str, dict[str, str]] = {}  # rule name -> raw vars
+        self.files: list[str] = []  # parsed ninja files; Edge.src indexes here
+        self._cur_file = 0
         self._norm_cache: dict[str, str] = {}
 
     def norm(self, path: str) -> str:
@@ -86,6 +89,15 @@ class NinjaManifest:
 
     def parse(self, path: Path) -> None:
         text = path.read_text(encoding="utf-8", errors="replace")
+        prev_file = self._cur_file
+        self._cur_file = len(self.files)
+        self.files.append(path.as_posix())
+        try:
+            self._parse_text(text)
+        finally:
+            self._cur_file = prev_file
+
+    def _parse_text(self, text: str) -> None:
         context: dict[str, str] | None = None  # bindings of the open rule/build block
         for line in self._logical_lines(text):
             if not line or line.lstrip().startswith("#"):
@@ -303,6 +315,7 @@ class NinjaManifest:
             display=out_paths[0],
             raw_out=explicit_outs,
             raw_in=explicit_ins,
+            src=self._cur_file,
         )
         self.edges.append(edge)
         return edge.bindings
@@ -790,13 +803,310 @@ def classify_rule(rule: str) -> str:
     r = rule.upper()
     if "CUSTOM_COMMAND" in r:
         return "codegen"
-    if "STATIC_LIBRARY" in r or r.startswith("AR") or "_AR_" in r:
+    if "STATIC_LIBRARY" in r or r.startswith("AR") or "_AR_" in r or "ALINK" in r:
         return "archive"
     if "LINKER" in r or "LINK" in r:
         return "link"
     if "COMPILER" in r or r.startswith(("CXX", "CC", "C_", "OBJC", "RC", "ASM")):
         return "compile"
     return "other"
+
+
+# --------------------------------------------------------------------------
+# target inference (grouping tasks into libraries / executables)
+# --------------------------------------------------------------------------
+
+_CMAKE_DIR_RE = re.compile(r"cmakefiles/([^/]+)\.dir/")
+_CMAKE_DIR_RAW_RE = re.compile(r"CMakeFiles/([^/]+)\.dir/", re.IGNORECASE)
+_LIB_SUFFIXES = (".a", ".so", ".dylib", ".lib", ".dll", ".exe")
+
+
+def _anchor_name(edge: Edge) -> str:
+    """Best-effort target name for an archive/link edge."""
+    if "__" in edge.rule:
+        # CMake >= 3.18 embeds the target: CXX_STATIC_LIBRARY_LINKER__foo_Debug
+        cand = edge.rule.split("__", 1)[1]
+        if "_" in cand:
+            cand = cand.rsplit("_", 1)[0]
+        if cand:
+            return cand
+    base = edge.display.replace("\\", "/").rsplit("/", 1)[-1]
+    for suf in _LIB_SUFFIXES:
+        if base.casefold().endswith(suf):
+            base = base[: -len(suf)]
+            break
+    if base.startswith("lib") and len(base) > 3:
+        base = base[3:]
+    return base or edge.display
+
+
+def infer_targets(manifest: NinjaManifest, tasks: list[Task],
+                  dep_lists: list[list[int]], order: list[int],
+                  cp_set: set[int]):
+    """Group tasks into build targets; return (targets, task_target).
+
+    targets is a list of dicts (name/kind/dir/selfMs/start/end/count/cp/deps),
+    task_target maps task id -> target index. Returns (None, None) when no
+    meaningful grouping exists. Signals, strongest first: the per-target
+    .ninja file GN emits via subninja, CMake's CMakeFiles/<target>.dir/
+    object paths, archive/link anchor edges, CMake utility-target
+    (add_custom_target) aliases claiming their codegen, generated sources
+    claimed via their target's object-order phony, single-consumer
+    codegen folded into the consuming target, remaining codegen grouped by
+    output directory into its own targets, then nearest consuming target for
+    stamps/leftovers and directory grouping for the rest. Matching runs on
+    normalized (casefolded) paths; names come from as-written paths.
+    """
+    n = len(tasks)
+    if n == 0:
+        return None, None
+    prefix = manifest.builddir.as_posix() + "/"
+    prefix_cf = prefix.casefold()
+
+    def rel(path: str) -> str:
+        p = path.replace("\\", "/")
+        if p.casefold().startswith(prefix_cf):
+            p = p[len(prefix):]
+        return p
+
+    groups: list[dict] = []
+    group_key: dict[tuple, int] = {}
+    group_of = [-1] * n
+
+    def get_group(key: tuple, name: str, dirname: str) -> int:
+        gi = group_key.get(key)
+        if gi is None:
+            gi = group_key[key] = len(groups)
+            groups.append({"name": name, "kind": "group", "dir": dirname})
+        return gi
+
+    # GN emits one .ninja file per target via subninja; when build edges come
+    # from more than two files (root + toolchain at minimum), the file is an
+    # exact target assignment. Root-file edges (stamps/regen) fall through.
+    gn_mode = len({t.edge.src for t in tasks}) > 2
+    kinds = [classify_rule(t.edge.rule) for t in tasks]
+
+    for t in tasks:
+        e = t.edge
+        if gn_mode and e.src != 0:
+            name = rel(manifest.files[e.src])
+            if name.endswith(".ninja"):
+                name = name[: -len(".ninja")]
+            if name.startswith("obj/"):
+                name = name[len("obj/"):]
+            dirname = name.rsplit("/", 1)[0] if "/" in name else ""
+            group_of[t.id] = get_group(("src", e.src), name, dirname)
+        elif e.outputs:
+            m = _CMAKE_DIR_RE.search(e.outputs[0])
+            if m:
+                out_rel = rel(e.display)
+                raw = _CMAKE_DIR_RAW_RE.search(out_rel)
+                name = raw.group(1) if raw else m.group(1)
+                dirname = out_rel[: raw.start()].rstrip("/") if raw else ""
+                group_of[t.id] = get_group(("cmake", m.group(1)), name, dirname)
+
+    # archive/link anchors name and type their group. A CMake anchor's
+    # objects live under CMakeFiles/<t>.dir/ among its inputs — merge it into
+    # that group (covers old CMake with generic linker rule names too).
+    for t in tasks:
+        ki = kinds[t.id]
+        if ki not in ("archive", "link"):
+            continue
+        gi = group_of[t.id]
+        if gi < 0:
+            votes: dict[tuple, int] = {}
+            for p in t.edge.inputs:
+                m = _CMAKE_DIR_RE.search(p)
+                if m:
+                    key = ("cmake", m.group(1))
+                    if key in group_key:
+                        votes[key] = votes.get(key, 0) + 1
+            if votes:
+                best = max(votes, key=lambda k: (votes[k], -group_key[k]))
+                if votes[best] * 2 >= sum(votes.values()):
+                    gi = group_key[best]
+        if gi < 0:
+            out_rel = rel(t.edge.display)
+            dirname = out_rel.rsplit("/", 1)[0] if "/" in out_rel else ""
+            gi = get_group(("anchor", t.id), _anchor_name(t.edge), dirname)
+        group_of[t.id] = gi
+        g = groups[gi]
+        if ki == "link":
+            out_cf = t.edge.display.casefold()
+            libish = (out_cf.endswith((".so", ".dylib", ".dll", ".a", ".lib"))
+                      or ".so." in out_cf)
+            g["kind"] = "lib" if libish else "exe"
+        elif g["kind"] != "exe":
+            g["kind"] = "lib"
+
+    # CMake utility targets (add_custom_target) own their codegen outputs.
+    # ninja spells one as an alias `build <name>: phony CMakeFiles/<name> …`
+    # over a stamp `CMakeFiles/<name>` — a phony over the target's DEPENDS
+    # outputs, or a real edge when the target runs its own COMMAND. Claiming
+    # these first keeps deliberately separate codegen targets separate; a
+    # generated file that is merely a library source stays unclaimed here
+    # and folds into the library below.
+    if not gn_mode:
+        out_task: dict[str, int] = {}
+        for t in tasks:
+            for o in t.edge.outputs:
+                out_task.setdefault(o, t.id)
+        phony_ins: dict[str, list[str]] = {}
+        for e in manifest.edges:
+            if e.rule == "phony" and e.outputs:
+                phony_ins.setdefault(e.outputs[0], e.inputs)
+        claim: dict[int, str] = {}      # task id -> owning stamp path
+        contested: set[int] = set()
+        stamp_name: dict[str, str] = {}
+        for e in manifest.edges:
+            if e.rule != "phony" or not e.outputs or not e.inputs:
+                continue
+            want = "/cmakefiles/" + e.outputs[0].rsplit("/", 1)[-1]
+            stamp = next((p for p in e.inputs if p.endswith(want)), None)
+            if stamp is None:
+                continue
+            stamp_name.setdefault(stamp, rel(e.display).rsplit("/", 1)[-1])
+            ti = out_task.get(stamp)
+            owned = [ti] if ti is not None else [
+                out_task[p] for p in phony_ins.get(stamp, ()) if p in out_task]
+            for ti in owned:
+                if group_of[ti] >= 0 or kinds[ti] != "codegen":
+                    continue
+                if claim.setdefault(ti, stamp) != stamp:
+                    contested.add(ti)
+        for ti, stamp in claim.items():
+            if ti in contested:
+                continue
+            out_rel = rel(tasks[ti].edge.display)
+            dirname = out_rel.rsplit("/", 1)[0] if "/" in out_rel else ""
+            gi = get_group(("util", stamp), stamp_name[stamp], dirname)
+            groups[gi]["kind"] = "gen"
+            group_of[ti] = gi
+
+        # a target's own generated sources appear as direct file inputs of
+        # its cmake_object_order_depends_target_<t> phony (dependency targets
+        # appear there as aliases, not files): claim them for the target,
+        # like CMake attaches the add_custom_command() that produces them.
+        oo = "cmake_object_order_depends_target_"
+        own: dict[int, int] = {}        # task id -> owning group
+        shared: set[int] = set()
+        for e in manifest.edges:
+            if e.rule != "phony" or not e.outputs:
+                continue
+            base = e.outputs[0].rsplit("/", 1)[-1]
+            if not base.startswith(oo):
+                continue
+            gi = group_key.get(("cmake", base[len(oo):]))
+            if gi is None:
+                continue
+            for p in e.inputs:
+                ti = out_task.get(p)
+                if ti is None or group_of[ti] >= 0 or kinds[ti] != "codegen":
+                    continue
+                if own.setdefault(ti, gi) != gi:
+                    shared.add(ti)
+        for ti, gi in own.items():
+            if ti not in shared:
+                group_of[ti] = gi
+
+    # the consumer graph, used by the codegen fold below and the
+    # nearest-consumer walk after it
+    succs: list[list[int]] = [[] for _ in range(n)]
+    for t in tasks:
+        for d in dep_lists[t.dl]:
+            succs[d].append(t.id)
+
+    # remaining codegen: a custom command consumed by a single target is a
+    # generated source of that target — fold it in, matching how CMake
+    # attaches an unanchored add_custom_command() to the consuming target.
+    # Codegen with no assigned consumers or several consuming targets becomes
+    # its own target grouped by output directory, keeping codegen chains
+    # visible instead of dissolving them into their consumers. Reverse
+    # topological order so chains resolve consumer-first.
+    for i in reversed(order):
+        if group_of[i] >= 0 or kinds[i] != "codegen":
+            continue
+        consumers = {group_of[s] for s in succs[i] if group_of[s] >= 0}
+        if len(consumers) == 1:
+            group_of[i] = consumers.pop()
+            continue
+        out_rel = rel(tasks[i].edge.display)
+        dirname = out_rel.rsplit("/", 1)[0] if "/" in out_rel else ""
+        parent = dirname.rsplit("/", 1)[0] if "/" in dirname else ""
+        gi = get_group(("gen", dirname), dirname or "(generated)", parent)
+        groups[gi]["kind"] = "gen"
+        group_of[i] = gi
+
+    # remaining custom commands / stamps: assign to the nearest consuming
+    # assigned target. Among candidates at the minimal distance prefer a
+    # group whose name appears in the task's own path (generated/<target>/…),
+    # then the group with the most consumers there, then the smallest group
+    # index — deterministic either way.
+    INF = 1 << 30
+    dist = [INF] * n
+    nearest = [-1] * n
+    for i in reversed(order):
+        if group_of[i] >= 0:
+            dist[i] = 0
+            nearest[i] = group_of[i]
+            continue
+        bd = INF
+        votes: dict[int, int] = {}
+        for s in succs[i]:
+            ds = dist[s]
+            if ds >= INF:
+                continue
+            if ds + 1 < bd:
+                bd = ds + 1
+                votes = {nearest[s]: 1}
+            elif ds + 1 == bd:
+                votes[nearest[s]] = votes.get(nearest[s], 0) + 1
+        if votes:
+            dist[i] = bd
+            cands = list(votes)
+            if len(cands) > 1:
+                comps = set(rel(tasks[i].edge.display).split("/"))
+                named = [g for g in cands if groups[g]["name"] in comps]
+                if named:
+                    cands = named
+            nearest[i] = max(cands, key=lambda g: (votes[g], -g))
+    for i in range(n):
+        if group_of[i] < 0 and nearest[i] >= 0:
+            group_of[i] = nearest[i]
+
+    # leftovers with no downstream anchor: group by directory
+    for t in tasks:
+        if group_of[t.id] >= 0:
+            continue
+        parts = rel(t.edge.display).split("/")
+        dirname = "/".join(parts[:-1][:2])
+        group_of[t.id] = get_group(("dir", dirname), dirname or "(top level)",
+                                   dirname)
+
+    if len(groups) < 2 or len(groups) > 0.8 * n:
+        return None, None
+
+    for g in groups:
+        g.update(selfMs=0, count=0, start=None, end=None, cp=0)
+    dep_sets: list[set[int]] = [set() for _ in groups]
+    for t in tasks:
+        gi = group_of[t.id]
+        g = groups[gi]
+        g["selfMs"] += t.dur
+        g["count"] += 1
+        if t.start is not None:
+            g["start"] = t.start if g["start"] is None else min(g["start"], t.start)
+            g["end"] = t.end if g["end"] is None else max(g["end"], t.end)
+        if t.id in cp_set:
+            g["cp"] = 1
+        ds = dep_sets[gi]
+        for d in dep_lists[t.dl]:
+            gd = group_of[d]
+            if gd != gi:
+                ds.add(gd)
+    for gi, g in enumerate(groups):
+        g["deps"] = sorted(dep_sets[gi])
+    return groups, group_of
 
 
 # --------------------------------------------------------------------------
@@ -907,6 +1217,14 @@ def build_report(builddir: Path, title: str | None, no_deps: bool,
     rule_idx = {r: i for i, r in enumerate(rules)}
     cp_set = set(cp_path)
 
+    targets = task_target = None
+    try:
+        targets, task_target = infer_targets(manifest, tasks, dep_lists,
+                                             order, cp_set)
+    except Exception as exc:  # inference must never break report generation
+        print(f"warning: target inference failed ({exc}); target views "
+              "disabled", file=sys.stderr)
+
     def display_name(t: Task) -> str:
         name = t.edge.display.replace("\\", "/")
         prefix = builddir.as_posix() + "/"
@@ -955,6 +1273,17 @@ def build_report(builddir: Path, title: str | None, no_deps: bool,
         cols["cmd"] = cmds
     data["tasksCols"] = cols
     data["depLists"] = dep_lists
+
+    if targets is not None:
+        cols["target"] = task_target
+        data["targetsCols"] = {k: [g[k] for g in targets] for k in
+                               ("name", "kind", "dir", "selfMs", "start",
+                                "end", "count", "cp", "deps")}
+        data["meta"]["targetCount"] = len(targets)
+        n_lib = sum(1 for g in targets if g["kind"] == "lib")
+        n_exe = sum(1 for g in targets if g["kind"] == "exe")
+        print(f"targets        : {len(targets)} inferred "
+              f"({n_lib} libs, {n_exe} exes)")
 
     if wall is not None:
         print(f"wall time      : {wall / 1000:.1f}s")

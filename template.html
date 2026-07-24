@@ -228,7 +228,7 @@
   .detail-info b { display: block; font-size: 14px; font-weight: 600; color: var(--text-primary); }
   .detail-links { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 24px; margin: 6px 0 10px; }
   @media (max-width: 900px) { .detail-links { grid-template-columns: 1fr; } }
-  .detail-links h3, #detailCmd h3 {
+  .detail-links h3, #detailCmd h3, #targetDetailSection h3 {
     font-size: 11px; color: var(--text-muted); text-transform: uppercase;
     letter-spacing: 0.05em; margin: 8px 0 4px; font-weight: 600;
   }
@@ -266,6 +266,9 @@
   .bp-grid th { color: var(--text-muted); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; }
   .bp-grid tr[data-id] { cursor: pointer; }
   .bp-grid tr[data-id]:hover { background: color-mix(in srgb, var(--text-primary) 5%, transparent); }
+
+  #treemapPanel canvas { display: block; width: 100%; cursor: pointer; }
+  #treemapCrumbs { min-height: 28px; }
 </style>
 </head>
 <body>
@@ -289,6 +292,8 @@
   <div class="tabbar">
     <div class="tab active" data-view="overview">Overview</div>
     <div class="tab" data-view="timeline">Timeline</div>
+    <div class="tab" data-view="targets" id="tabTargets">Targets</div>
+    <div class="tab" data-view="treemap" id="tabTreemap">Treemap</div>
     <div class="tab" data-view="insights">Insights<span class="badge" id="insightsBadge" style="display:none"></span></div>
     <div class="tab" data-view="profile">Profiling</div>
   </div>
@@ -402,6 +407,51 @@
           <div class="panel cp-table"><h3>Most expensive functions (codegen + opt)</h3><table id="bpFunctions"></table></div>
         </div>
       </div>
+    </section>
+  </div>
+
+  <div class="view" id="view-targets">
+    <section>
+      <h2>Target dependency graph</h2>
+      <p class="sub">Targets inferred from the Ninja graph (CMake object directories and rule names, GN per-target files, archive/link steps elsewhere; generated code follows its CMake custom target when one exists, otherwise it joins its consuming target or forms its own target per output directory). Node height tracks total build time. Hover or click a target to see its edges — dependencies connect on the left, dependents on the right.</p>
+      <div class="toolbar" id="targetToolbar">
+        <span class="chip"><span class="sw" data-kind="archive"></span>library</span>
+        <span class="chip"><span class="sw" data-kind="link"></span>executable</span>
+        <span class="chip"><span class="sw" data-kind="codegen"></span>generated</span>
+        <span class="chip"><span class="sw" data-kind="other"></span>group</span>
+        <label><input type="checkbox" id="tredToggle"> hide transitive edges</label>
+        <label><input type="checkbox" id="allEdgesToggle"> draw all edges</label>
+        <span class="hint">wheel = zoom · drag = pan · click = select · double-click = fit</span>
+      </div>
+      <div class="panel timeline" id="graphPanel"></div>
+    </section>
+
+    <section id="targetDetailSection" style="display:none">
+      <h2>Target detail</h2>
+      <p class="sub">Selected from the graph — its tasks light up in the timeline views. Click a dependency or dependent to walk the graph, click a task to open it in the timeline.</p>
+      <div class="panel">
+        <div class="detail-head">
+          <span class="chip"><span class="sw" id="tdKindSw"></span><span id="tdKind"></span></span>
+          <b id="tdName"></b>
+          <span class="spacer"></span>
+          <button id="tdClose" title="Close">×</button>
+        </div>
+        <div class="detail-info" id="tdInfo"></div>
+        <div class="detail-links">
+          <div><h3>depends on</h3><div class="dep-list" id="tdDeps"></div></div>
+          <div><h3>dependents</h3><div class="dep-list" id="tdRdeps"></div></div>
+        </div>
+        <div><h3>tasks, most expensive first</h3><div class="dep-list" id="tdTasks"></div></div>
+      </div>
+    </section>
+  </div>
+
+  <div class="view" id="view-treemap">
+    <section>
+      <h2>Build time treemap</h2>
+      <p class="sub">Box area is the total build time spent in each part — directories contain targets, targets contain their tasks. Click a box to zoom in, use the breadcrumb to zoom back out; clicking an individual task opens it in the timeline.</p>
+      <div class="toolbar" id="treemapCrumbs"></div>
+      <div class="panel" id="treemapPanel"></div>
     </section>
   </div>
 </div>
@@ -531,6 +581,25 @@ function pathTo(id) { // task ids on the critical path leading to `id`
   for (let i = id; i >= 0; i = bestPred[i]) ids.push(i);
   return ids;
 }
+
+// --------------------------------------------------------------- targets ---
+// Target-level view of the same graph, inferred by the generator (absent in
+// old reports or when inference found nothing meaningful).
+const TG = (() => {
+  const c = DATA.targetsCols;
+  if (!c || c.name.length < 2 || !DATA.tasksCols.target) return null;
+  const targets = c.name.map((name, i) => ({
+    id: i, name, kind: c.kind[i], dir: c.dir[i], selfMs: c.selfMs[i],
+    start: c.start[i], end: c.end[i], count: c.count[i], cp: !!c.cp[i],
+    deps: c.deps[i], rdeps: [], tasks: [],
+  }));
+  targets.forEach(t => t.deps.forEach(d => targets[d].rdeps.push(t.id)));
+  DATA.tasksCols.target.forEach((g, i) => { if (g >= 0) targets[g].tasks.push(i); });
+  return targets;
+})();
+// target kinds borrow the task-kind palette: lib=archive, exe=link, group=other
+const TARGET_KIND = { lib: "archive", exe: "link", gen: "codegen", group: "other" };
+const targetColor = t => kindColor(TARGET_KIND[t.kind] || "other");
 
 // ------------------------------------------------------------- scheduling ---
 function schedule(cores) {
@@ -1019,9 +1088,676 @@ function go(view) {
     if (flameView) flameView.resize();
   } else if (view === "overview") {
     if (chart) chart.resize(); else renderSpeedupChart();
+  } else if (view === "targets") {
+    if (graphView) graphView.ensure();
+  } else if (view === "treemap") {
+    if (treemapView) treemapView.ensure();
   }
 }
 document.querySelectorAll(".tab").forEach(t => t.addEventListener("click", () => go(t.dataset.view)));
+
+// ------------------------------------------------------- target DAG view ---
+// Layered left-to-right DAG of inferred targets on a pan/zoom canvas. The
+// hairball defense for big builds: edges are drawn only for the hovered or
+// selected target (plus an optional low-alpha "all edges" wash), fan-in/out
+// shows as count badges, and huge graphs draw only the most expensive nodes.
+const GRAPH_NODE_CAP = 4000;
+
+class GraphView {
+  constructor(container) {
+    this.container = container;
+    this.canvas = document.createElement("canvas");
+    this.note = document.createElement("div");
+    this.note.className = "lanes-note";
+    container.append(this.canvas, this.note);
+    this.ready = false;
+    this.scale = 1; this.tx = 0; this.ty = 0;
+    this.hoverId = null;
+    this.selected = null;
+    this.allEdges = false;
+    this.useReduced = false;
+    this.reducedDeps = null;
+    this.reducedRdeps = null;
+    this.w = 0; this.h = 0;
+    this._bindEvents();
+  }
+
+  ensure() {
+    if (!this.ready) { this._layout(); this.ready = true; }
+    this.resize();
+  }
+
+  // Sugiyama-lite: longest-path layering, then a few barycenter sweeps to
+  // reduce crossings. Node height tracks sqrt(total build time).
+  _layout() {
+    let vis = TG;
+    if (TG.length > GRAPH_NODE_CAP) {
+      vis = [...TG].sort((a, b) => b.selfMs - a.selfMs).slice(0, GRAPH_NODE_CAP);
+      this.note.textContent = `Showing the ${GRAPH_NODE_CAP} targets with the most build time (of ${TG.length}) — use the treemap or search for the rest.`;
+      this.note.style.display = "block";
+    }
+    const inVis = new Set(vis.map(t => t.id));
+    // cycle-tolerant Kahn order (target-level cycles can appear when tasks of
+    // two targets interleave; leftovers get a best-effort layer)
+    const indeg = new Map(vis.map(t => [t.id, t.deps.filter(d => inVis.has(d)).length]));
+    const order = vis.filter(t => !indeg.get(t.id)).map(t => t.id);
+    for (let h = 0; h < order.length; h++)
+      for (const s of TG[order[h]].rdeps) {
+        if (!inVis.has(s)) continue;
+        const left = indeg.get(s) - 1;
+        indeg.set(s, left);
+        if (left === 0) order.push(s);
+      }
+    if (order.length < vis.length) {
+      const seen = new Set(order);
+      for (const t of vis) if (!seen.has(t.id)) order.push(t.id);
+    }
+    const layer = new Map();
+    for (const id of order) {
+      let m = -1;
+      for (const d of TG[id].deps)
+        if (layer.has(d) && layer.get(d) > m) m = layer.get(d);
+      layer.set(id, m + 1);
+    }
+    let layers = [];
+    for (const id of order) (layers[layer.get(id)] ||= []).push(id);
+    layers = layers.filter(Boolean);
+    const pos = new Map();
+    layers.forEach(L => L.forEach((id, i) => pos.set(id, i)));
+    const meanPos = (id, neigh) => {
+      let s = 0, n = 0;
+      for (const o of neigh) if (pos.has(o)) { s += pos.get(o); n++; }
+      return n ? s / n : pos.get(id);
+    };
+    for (let sweep = 0; sweep < 4; sweep++) {
+      const useDeps = sweep % 2 === 0;
+      for (const L of useDeps ? layers : [...layers].reverse()) {
+        L.sort((a, b) =>
+          meanPos(a, useDeps ? TG[a].deps : TG[a].rdeps) -
+          meanPos(b, useDeps ? TG[b].deps : TG[b].rdeps) || a - b);
+        L.forEach((id, i) => pos.set(id, i));
+      }
+    }
+    const maxSelf = Math.max(1, ...vis.map(t => t.selfMs));
+    const nodeH = ms => 18 + Math.round(46 * Math.sqrt(ms / maxSelf));
+    const NODE_W = 170, GAP_X = 90, GAP_Y = 10;
+    const colH = layers.map(L =>
+      L.reduce((s, id) => s + nodeH(TG[id].selfMs) + GAP_Y, -GAP_Y));
+    const maxColH = Math.max(...colH);
+    this.nodes = new Map();
+    layers.forEach((L, li) => {
+      let y = (maxColH - colH[li]) / 2;
+      const x = li * (NODE_W + GAP_X);
+      for (const id of L) {
+        const h = nodeH(TG[id].selfMs);
+        this.nodes.set(id, { x, y, w: NODE_W, h });
+        y += h + GAP_Y;
+      }
+    });
+    this.bbox = { w: layers.length * (NODE_W + GAP_X) - GAP_X, h: maxColH };
+    this.edgeCount = vis.reduce((s, t) => s + t.deps.length, 0);
+    const all = $("allEdgesToggle");
+    all.disabled = this.edgeCount > 3000;
+    if (all.disabled) all.parentElement.title = `${this.edgeCount} edges — too many to draw at once`;
+  }
+
+  // transitive reduction via per-node reachability bitsets; only offered for
+  // graphs small enough that V*V/8 bytes is trivial
+  computeReduction() {
+    if (this.reducedDeps) return true;
+    const V = TG.length;
+    if (V > 4096) return false;
+    const W = (V + 31) >> 5;
+    const indeg = TG.map(t => t.deps.length);
+    const order = [];
+    for (let i = 0; i < V; i++) if (!indeg[i]) order.push(i);
+    for (let h = 0; h < order.length; h++)
+      for (const s of TG[order[h]].rdeps) if (--indeg[s] === 0) order.push(s);
+    if (order.length < V) {
+      const seen = new Set(order);
+      for (let i = 0; i < V; i++) if (!seen.has(i)) order.push(i);
+    }
+    const reach = new Uint32Array(V * W); // transitive dependency bitsets
+    for (const i of order) {
+      const base = i * W;
+      for (const d of TG[i].deps) {
+        const db = d * W;
+        for (let k = 0; k < W; k++) reach[base + k] |= reach[db + k];
+        reach[base + (d >> 5)] |= 1 << (d & 31);
+      }
+    }
+    const has = (i, d) => (reach[i * W + (d >> 5)] >>> (d & 31)) & 1;
+    this.reducedDeps = TG.map(t =>
+      t.deps.filter(d => !t.deps.some(o => o !== d && has(o, d))));
+    this.reducedRdeps = TG.map(() => []);
+    this.reducedDeps.forEach((ds, i) => ds.forEach(d => this.reducedRdeps[d].push(i)));
+    return true;
+  }
+
+  depsOf(id) { return this.useReduced && this.reducedDeps ? this.reducedDeps[id] : TG[id].deps; }
+  rdepsOf(id) { return this.useReduced && this.reducedRdeps ? this.reducedRdeps[id] : TG[id].rdeps; }
+
+  resize() {
+    const w = this.container.clientWidth - 24;
+    if (w <= 0 || !this.ready) return;
+    const h = Math.min(620, Math.max(380, innerHeight - 330));
+    const dpr = window.devicePixelRatio || 1;
+    this.canvas.width = Math.round(w * dpr);
+    this.canvas.height = Math.round(h * dpr);
+    this.canvas.style.width = w + "px";
+    this.canvas.style.height = h + "px";
+    this.canvas.getContext("2d").setTransform(dpr, 0, 0, dpr, 0, 0);
+    this.w = w; this.h = h;
+    if (!this._fitted) { this.fit(); this._fitted = true; }
+    this.render();
+  }
+
+  fit() {
+    this.scale = Math.max(Math.min((this.w - 32) / Math.max(this.bbox.w, 1),
+                                   (this.h - 32) / Math.max(this.bbox.h, 1), 1.4), 0.02);
+    this.tx = (this.w - this.bbox.w * this.scale) / 2;
+    this.ty = (this.h - this.bbox.h * this.scale) / 2;
+  }
+
+  render() {
+    if (!this.ready || !this.w) return;
+    const g = this.canvas.getContext("2d");
+    g.clearRect(0, 0, this.w, this.h);
+    const s = this.scale;
+    const sx = x => x * s + this.tx, sy = y => y * s + this.ty;
+    const focus = this.hoverId ?? this.selected;
+    const focusVisible = focus != null && this.nodes.has(focus);
+    const drawEdge = (from, to) => { // from = dependency, to = dependent
+      const a = this.nodes.get(from), b = this.nodes.get(to);
+      if (!a || !b) return;
+      const x0 = sx(a.x + a.w), y0 = sy(a.y + a.h / 2);
+      const x1 = sx(b.x), y1 = sy(b.y + b.h / 2);
+      const dx = Math.max((x1 - x0) / 2, 24 * s);
+      g.beginPath();
+      g.moveTo(x0, y0);
+      g.bezierCurveTo(x0 + dx, y0, x1 - dx, y1, x1, y1);
+      g.stroke();
+    };
+
+    if (this.allEdges && this.edgeCount <= 3000) {
+      g.strokeStyle = cssVar("--text-muted");
+      g.lineWidth = 1;
+      g.globalAlpha = 0.1;
+      for (const id of this.nodes.keys()) for (const d of this.depsOf(id)) drawEdge(d, id);
+      g.globalAlpha = 1;
+    }
+
+    let neigh = null;
+    if (focusVisible)
+      neigh = new Set([focus, ...this.depsOf(focus), ...this.rdepsOf(focus)]);
+
+    const critical = cssVar("--critical");
+    const ink = {};
+    for (const k in TARGET_KIND) ink[k] = contrastInk(kindColor(TARGET_KIND[k]));
+    g.textBaseline = "middle";
+    // two passes: dimmed context first, then the focused neighborhood on top
+    // of its edges, so edges never slice through readable labels
+    const visible = [];
+    for (const [id, n] of this.nodes) {
+      const x = sx(n.x), y = sy(n.y), w = n.w * s, h = n.h * s;
+      if (x + w < 0 || x > this.w || y + h < 0 || y > this.h) continue;
+      visible.push([id, n, neigh !== null && !neigh.has(id)]);
+    }
+    const drawNode = (id, n, dim) => {
+      const x = sx(n.x), y = sy(n.y), w = n.w * s, h = n.h * s;
+      const t = TG[id];
+      g.globalAlpha = dim ? 0.3 : 1;
+      g.fillStyle = targetColor(t);
+      if (w > 6 && h > 6) roundRect(g, x, y, w, h, 3);
+      else g.fillRect(x, y, Math.max(w, 1), Math.max(h, 1));
+      if (t.cp && h > 8) {
+        g.strokeStyle = critical; g.lineWidth = 1.5;
+        g.strokeRect(x + 0.75, y + 0.75, w - 1.5, h - 1.5);
+      }
+      if (id === this.selected || id === this.hoverId) {
+        g.globalAlpha = 1;
+        g.strokeStyle = primaryInk(1); g.lineWidth = 1.6;
+        g.strokeRect(x + 0.8, y + 0.8, w - 1.6, h - 1.6);
+      }
+      if (w >= 64 && h >= 13) {
+        g.save();
+        g.beginPath(); g.rect(x + 4, y, w - 8, h); g.clip();
+        g.fillStyle = ink[t.kind] || "#ffffff";
+        const showBadge = w >= 130;
+        const badge = "‹" + this.depsOf(id).length + " ›" + this.rdepsOf(id).length;
+        // room for the ‹deps ›dependents badge: ~6.3px/char name, ~5.5px/char badge
+        const cap = showBadge
+          ? Math.max(8, Math.floor((w - 18 - 5.5 * badge.length) / 6.3)) : 26;
+        const nm = t.name.length > cap ? "…" + t.name.slice(-(cap - 1)) : t.name;
+        const nameY = h >= 32 ? y + h / 2 - 8 : y + h / 2 + 0.5;
+        g.font = (h >= 32 ? "600 11.5px" : "600 10.5px") + " system-ui, sans-serif";
+        g.fillText(nm, x + 6, nameY);
+        if (showBadge) {
+          g.textAlign = "right";
+          g.font = "9.5px system-ui, sans-serif";
+          g.fillText(badge, x + w - 6, nameY);
+          g.textAlign = "left";
+        }
+        if (h >= 32) {
+          g.font = "10.5px system-ui, sans-serif";
+          g.fillText(fmtMs(t.selfMs) + " · " + t.count + (t.count === 1 ? " task" : " tasks"),
+                     x + 6, y + h / 2 + 8);
+        }
+        g.restore();
+      }
+    };
+    for (const [id, n, dim] of visible) if (dim) drawNode(id, n, dim);
+    if (focusVisible) {
+      g.globalAlpha = 0.9;
+      g.lineWidth = 1.6;
+      g.strokeStyle = kindColor("archive");   // dependencies, into the left side
+      for (const d of this.depsOf(focus)) drawEdge(d, focus);
+      g.strokeStyle = kindColor("compile");   // dependents, out of the right side
+      for (const r of this.rdepsOf(focus)) drawEdge(focus, r);
+    }
+    for (const [id, n, dim] of visible) if (!dim) drawNode(id, n, dim);
+    g.globalAlpha = 1;
+    g.textBaseline = "alphabetic";
+  }
+
+  nodeAt(px, py) {
+    if (!this.ready) return null;
+    const wx = (px - this.tx) / this.scale, wy = (py - this.ty) / this.scale;
+    for (const [id, n] of this.nodes)
+      if (wx >= n.x && wx <= n.x + n.w && wy >= n.y && wy <= n.y + n.h) return id;
+    return null;
+  }
+
+  focusTarget(id) {
+    const n = this.nodes.get(id);
+    if (!n) return;
+    this.scale = Math.max(this.scale, 0.9);
+    this.tx = this.w / 2 - (n.x + n.w / 2) * this.scale;
+    this.ty = this.h / 2 - (n.y + n.h / 2) * this.scale;
+    this.render();
+  }
+
+  _bindEvents() {
+    const tip = $("tooltip");
+    const cv = this.canvas;
+    cv.addEventListener("wheel", e => {
+      e.preventDefault();
+      const r = cv.getBoundingClientRect();
+      const px = e.clientX - r.left, py = e.clientY - r.top;
+      const ns = Math.min(Math.max(this.scale * Math.exp(-e.deltaY * 0.0015), 0.02), 4);
+      this.tx = px - (px - this.tx) * (ns / this.scale);
+      this.ty = py - (py - this.ty) * (ns / this.scale);
+      this.scale = ns;
+      this.render();
+    }, { passive: false });
+    let drag = null;
+    cv.addEventListener("mousedown", e => {
+      drag = { x: e.clientX, y: e.clientY, tx: this.tx, ty: this.ty, moved: false };
+      cv.classList.add("dragging");
+    });
+    window.addEventListener("mouseup", () => {
+      this._suppressClick = drag ? drag.moved : false;
+      drag = null;
+      cv.classList.remove("dragging");
+    });
+    cv.addEventListener("mousemove", e => {
+      const r = cv.getBoundingClientRect();
+      if (drag) {
+        if (Math.abs(e.clientX - drag.x) + Math.abs(e.clientY - drag.y) > 4) drag.moved = true;
+        this.tx = drag.tx + e.clientX - drag.x;
+        this.ty = drag.ty + e.clientY - drag.y;
+        this.render();
+        return;
+      }
+      const id = this.nodeAt(e.clientX - r.left, e.clientY - r.top);
+      if (id !== this.hoverId) { this.hoverId = id; this.render(); }
+      cv.style.cursor = id != null ? "pointer" : "";
+      if (id == null) { tip.style.display = "none"; return; }
+      const t = TG[id];
+      const kindLabel = t.kind === "lib" ? "library" : t.kind === "exe" ? "executable" : t.kind === "gen" ? "generated" : "group";
+      tip.innerHTML = `<div class="tname">${esc(t.name)}</div>` +
+        `<div class="trow"><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:${targetColor(t)}"></span> ` +
+        `${kindLabel}${t.dir ? " · " + esc(t.dir) : ""}</div>` +
+        `<div class="trow">total build time ${fmtMs(t.selfMs, true)} across ${t.count} task${t.count === 1 ? "" : "s"}</div>` +
+        (t.start != null ? `<div class="trow">active ${fmtMs(t.start)} → ${fmtMs(t.end)}</div>` : "") +
+        `<div class="trow">${t.deps.length} dependencies · ${t.rdeps.length} dependents` +
+        `${t.cp ? ' · <span class="cpbadge">on critical path</span>' : ""}</div>`;
+      tip.style.display = "block";
+      tip.style.left = Math.min(e.clientX + 14, innerWidth - tip.offsetWidth - 8) + "px";
+      tip.style.top = Math.min(e.clientY + 14, innerHeight - tip.offsetHeight - 8) + "px";
+    });
+    cv.addEventListener("mouseleave", () => {
+      tip.style.display = "none";
+      cv.style.cursor = "";
+      if (this.hoverId != null) { this.hoverId = null; this.render(); }
+    });
+    cv.addEventListener("click", e => {
+      if (this._suppressClick) return;
+      const r = cv.getBoundingClientRect();
+      const id = this.nodeAt(e.clientX - r.left, e.clientY - r.top);
+      if (id != null) toggleTarget(id);
+    });
+    cv.addEventListener("dblclick", () => { this.fit(); this.render(); });
+  }
+}
+
+// --------------------------------------------------------- treemap view ---
+// Squarified treemap of build time: directories contain targets, targets
+// contain their tasks. Click descends, breadcrumb / right-click ascends.
+function buildTreemapRoot() {
+  const dirs = new Map();
+  for (const t of TG) {
+    if (t.selfMs <= 0) continue;
+    const key = t.dir || "(top level)";
+    let d = dirs.get(key);
+    if (!d) dirs.set(key, d = { name: key, kind: "dir", value: 0, children: [] });
+    d.value += t.selfMs;
+    d.children.push({ name: t.name, kind: "target", value: t.selfMs, target: t.id });
+  }
+  let children = [...dirs.values()];
+  for (const d of children) d.children.sort((a, b) => b.value - a.value);
+  if (children.length === 1) children = children[0].children; // flat build
+  children.sort((a, b) => b.value - a.value);
+  return { name: "whole build", kind: "root",
+           value: children.reduce((s, c) => s + c.value, 0), children };
+}
+
+function targetChildren(node) {
+  if (node.children) return node.children;
+  node.children = TG[node.target].tasks
+    .filter(id => T[id].dur > 0)
+    .map(id => ({ name: T[id].name, kind: "task", value: T[id].dur, task: id }))
+    .sort((a, b) => b.value - a.value);
+  return node.children;
+}
+
+// Bruls et al. squarified layout: grow a row along the shorter side while the
+// worst aspect ratio keeps improving
+function squarify(children, x, y, w, h) {
+  const total = children.reduce((s, c) => s + c.value, 0);
+  const out = [];
+  if (!total || w <= 2 || h <= 2) return out;
+  const scale = (w * h) / total;
+  let i = 0;
+  while (i < children.length && w > 1 && h > 1) {
+    const vertical = w < h; // row runs along the shorter side
+    const side = vertical ? w : h;
+    const s2 = side * side;
+    let rowArea = 0, worst = Infinity, mx = 0, mn = Infinity, j = i;
+    for (; j < children.length; j++) {
+      const a = children[j].value * scale;
+      const na = rowArea + a;
+      const nmx = Math.max(mx, a), nmn = Math.min(mn, a);
+      const nw = Math.max(s2 * nmx / (na * na), (na * na) / (s2 * nmn));
+      if (nw > worst) break;
+      worst = nw; rowArea = na; mx = nmx; mn = nmn;
+    }
+    const thick = rowArea / side;
+    let off = 0;
+    for (let k = i; k < j; k++) {
+      const len = children[k].value * scale / thick;
+      out.push(vertical
+        ? { node: children[k], x: x + off, y, w: len, h: thick }
+        : { node: children[k], x, y: y + off, w: thick, h: len });
+      off += len;
+    }
+    if (vertical) { y += thick; h -= thick; } else { x += thick; w -= thick; }
+    i = j;
+  }
+  return out;
+}
+
+class TreemapView {
+  constructor(container) {
+    this.container = container;
+    this.canvas = document.createElement("canvas");
+    container.append(this.canvas);
+    this.ready = false;
+    this.stack = [];
+    this.tiles = [];
+    this.hover = null;
+    this.w = 0; this.h = 0;
+    this._bindEvents();
+  }
+
+  ensure() {
+    if (!this.ready) {
+      this.root = buildTreemapRoot();
+      this.stack = [this.root];
+      this.ready = true;
+    }
+    this.resize();
+  }
+
+  resize() {
+    const w = this.container.clientWidth - 24;
+    if (w <= 0 || !this.ready) return;
+    const h = Math.min(600, Math.max(380, innerHeight - 330));
+    const dpr = window.devicePixelRatio || 1;
+    this.canvas.width = Math.round(w * dpr);
+    this.canvas.height = Math.round(h * dpr);
+    this.canvas.style.width = w + "px";
+    this.canvas.style.height = h + "px";
+    this.canvas.getContext("2d").setTransform(dpr, 0, 0, dpr, 0, 0);
+    this.w = w; this.h = h;
+    this.render();
+  }
+
+  render() {
+    if (!this.ready || !this.w) return;
+    const g = this.canvas.getContext("2d");
+    g.clearRect(0, 0, this.w, this.h);
+    this.tiles = [];
+    const cur = this.stack[this.stack.length - 1];
+    const children = cur.kind === "target" ? targetChildren(cur) : cur.children;
+    g.textBaseline = "middle";
+    for (const tl of squarify(children || [], 0, 0, this.w, this.h)) {
+      this.tiles.push(tl);
+      this._drawTile(g, tl, true);
+      const kids = tl.node.kind === "dir" ? tl.node.children
+                 : tl.node.kind === "target" ? targetChildren(tl.node) : null;
+      if (kids && kids.length && tl.w > 90 && tl.h > 60) {
+        const inner = squarify(kids, tl.x + 3, tl.y + 20, tl.w - 6, tl.h - 23);
+        for (const it of inner) { this.tiles.push(it); this._drawTile(g, it, false); }
+      }
+    }
+    g.textBaseline = "alphabetic";
+    this._crumbs();
+  }
+
+  _drawTile(g, tl, top) {
+    const { x, y, w, h, node } = tl;
+    if (w < 1.5 || h < 1.5) return;
+    const hov = this.hover === node;
+    if (node.kind === "dir") {
+      g.fillStyle = primaryInk(hov ? 0.11 : 0.05);
+      g.fillRect(x + 1, y + 1, w - 2, h - 2);
+      g.strokeStyle = cssVar("--grid");
+      g.lineWidth = 1;
+      g.strokeRect(x + 1.5, y + 1.5, w - 3, h - 3);
+    } else {
+      const color = node.kind === "target" ? targetColor(TG[node.target]) : kindColor(T[node.task].kind);
+      g.globalAlpha = hov ? 1 : 0.88;
+      g.fillStyle = color;
+      g.fillRect(x + 1, y + 1, w - 2, h - 2);
+      g.globalAlpha = 1;
+      const cp = node.kind === "target" ? TG[node.target].cp : T[node.task].cp;
+      if (cp && w > 10 && h > 10) {
+        g.strokeStyle = cssVar("--critical");
+        g.lineWidth = 1.5;
+        g.strokeRect(x + 1.75, y + 1.75, w - 3.5, h - 3.5);
+      }
+    }
+    if (w >= 56 && h >= 16) {
+      const color = node.kind === "dir" ? null
+        : node.kind === "target" ? targetColor(TG[node.target]) : kindColor(T[node.task].kind);
+      g.save();
+      g.beginPath(); g.rect(x + 4, y + 1, w - 8, Math.min(h - 2, 19)); g.clip();
+      g.fillStyle = color ? contrastInk(color) : cssVar("--text-secondary");
+      g.font = (top ? "600 11.5px" : "10.5px") + " system-ui, sans-serif";
+      const label = node.kind === "task" ? shortName(node.name) : node.name;
+      g.fillText(label + "  " + fmtMs(node.value), x + 6, y + 11);
+      g.restore();
+    }
+  }
+
+  _crumbs() {
+    $("treemapCrumbs").innerHTML = this.stack.map((n, i) =>
+      `<button class="btn btn-mini" data-i="${i}" ${i === this.stack.length - 1 ? "disabled" : ""}>` +
+      `${esc(n.name)}</button>`).join(`<span style="color:var(--text-muted)">›</span>`) +
+      (this.stack.length > 1 ? `<span class="hint">right-click = up one level</span>` : "");
+  }
+
+  tileAt(px, py) { // innermost tiles are pushed last, so scan backwards
+    for (let i = this.tiles.length - 1; i >= 0; i--) {
+      const t = this.tiles[i];
+      if (px >= t.x && px <= t.x + t.w && py >= t.y && py <= t.y + t.h) return t;
+    }
+    return null;
+  }
+
+  _bindEvents() {
+    const tip = $("tooltip");
+    const cv = this.canvas;
+    cv.addEventListener("mousemove", e => {
+      const r = cv.getBoundingClientRect();
+      const tl = this.tileAt(e.clientX - r.left, e.clientY - r.top);
+      const node = tl ? tl.node : null;
+      if (node !== this.hover) { this.hover = node; this.render(); }
+      if (!node) { tip.style.display = "none"; return; }
+      const total = Math.max(this.root.value, 1);
+      const parent = this.stack[this.stack.length - 1];
+      tip.innerHTML = `<div class="tname">${esc(node.name)}</div>` +
+        `<div class="trow">${fmtMs(node.value, true)}` +
+        (parent !== this.root || node.kind === "task" || this.stack.length > 1
+          ? ` · ${(100 * node.value / Math.max(parent.value, 1)).toFixed(1)}% of ${esc(parent.name)}` : "") +
+        ` · ${(100 * node.value / total).toFixed(1)}% of the build</div>` +
+        (node.kind === "target"
+          ? `<div class="trow">${TG[node.target].count} tasks · click to zoom in</div>`
+          : node.kind === "dir"
+            ? `<div class="trow">${node.children.length} targets · click to zoom in</div>`
+            : `<div class="trow">${T[node.task].kind} task · click to open in the timeline</div>`);
+      tip.style.display = "block";
+      tip.style.left = Math.min(e.clientX + 14, innerWidth - tip.offsetWidth - 8) + "px";
+      tip.style.top = Math.min(e.clientY + 14, innerHeight - tip.offsetHeight - 8) + "px";
+    });
+    cv.addEventListener("mouseleave", () => {
+      tip.style.display = "none";
+      if (this.hover != null) { this.hover = null; this.render(); }
+    });
+    cv.addEventListener("click", e => {
+      const r = cv.getBoundingClientRect();
+      const tl = this.tileAt(e.clientX - r.left, e.clientY - r.top);
+      if (!tl) return;
+      if (tl.node.kind === "task") { locateTask(tl.node.task); return; }
+      this.stack.push(tl.node);
+      this.hover = null;
+      this.render();
+    });
+    cv.addEventListener("contextmenu", e => {
+      e.preventDefault();
+      if (this.stack.length > 1) { this.stack.pop(); this.hover = null; this.render(); }
+    });
+  }
+}
+
+// ---------------------------------------------- target selection wiring ---
+const graphView = TG ? new GraphView($("graphPanel")) : null;
+const treemapView = TG ? new TreemapView($("treemapPanel")) : null;
+let selectedTargetId = null;
+
+function renderTargetList(el, ids, emptyText) {
+  const items = ids.map(i => TG[i]).sort((a, b) => b.selfMs - a.selfMs);
+  if (!items.length) { el.innerHTML = `<span class="dep-empty">${emptyText}</span>`; return; }
+  const row = t =>
+    `<div class="dep-row" data-tid="${t.id}">` +
+    `<span class="sw" style="background:${targetColor(t)}"></span>` +
+    `<span class="dep-name" title="${esc(t.name)}">${esc(t.name)}</span>` +
+    `<span class="dep-dur">${fmtMs(t.selfMs, true)}</span></div>`;
+  const CAP = 10;
+  el.innerHTML = items.slice(0, CAP).map(row).join("") +
+    (items.length > CAP ? `<button class="btn btn-mini dep-more">show all ${items.length}</button>` : "");
+  const more = el.querySelector(".dep-more");
+  if (more) more.addEventListener("click", e => {
+    e.stopPropagation();
+    el.innerHTML = items.map(row).join("");
+  });
+}
+
+function showTarget(id) {
+  selectedTargetId = id;
+  graphView.selected = id;
+  const t = TG[id];
+  $("targetDetailSection").style.display = "";
+  $("tdKindSw").style.background = targetColor(t);
+  $("tdKind").textContent = t.kind === "lib" ? "library" : t.kind === "exe" ? "executable" : t.kind === "gen" ? "generated" : "group";
+  $("tdName").textContent = t.name;
+  $("tdInfo").innerHTML = [
+    [fmtMs(t.selfMs, true), "total build time"],
+    [String(t.count), "tasks"],
+    [t.start != null ? fmtMs(t.start) + " → " + fmtMs(t.end) : "not built", "active span"],
+    [t.cp ? "yes" : "no", "critical path"],
+    ...(t.dir ? [[esc(t.dir), "directory"]] : []),
+  ].map(([v, l]) => `<div><b>${v}</b>${l}</div>`).join("");
+  renderTargetList($("tdDeps"), t.deps, "nothing — a root of the graph");
+  renderTargetList($("tdRdeps"), t.rdeps, "nothing — a terminal target");
+  renderDepList($("tdTasks"), t.tasks, "no tasks");
+  highlightIdSet(new Set(t.tasks)); // light this target up in the timelines
+  graphView.render();
+}
+
+function closeTargetDetail() {
+  selectedTargetId = null;
+  $("targetDetailSection").style.display = "none";
+  if (graphView) { graphView.selected = null; graphView.render(); }
+  highlightIdSet(null);
+}
+
+function toggleTarget(id) {
+  if (selectedTargetId === id) closeTargetDetail();
+  else showTarget(id);
+}
+
+if (TG) {
+  $("tdClose").addEventListener("click", closeTargetDetail);
+  for (const listId of ["tdDeps", "tdRdeps"]) {
+    $(listId).addEventListener("click", e => {
+      const row = e.target.closest(".dep-row[data-tid]");
+      if (row) { showTarget(+row.dataset.tid); graphView.focusTarget(+row.dataset.tid); }
+    });
+  }
+  $("tdTasks").addEventListener("click", e => {
+    const row = e.target.closest(".dep-row[data-id]");
+    if (row) locateTask(+row.dataset.id);
+  });
+  $("tredToggle").addEventListener("change", e => {
+    if (e.target.checked && !graphView.computeReduction()) {
+      e.target.checked = false;
+      return;
+    }
+    graphView.useReduced = e.target.checked;
+    graphView.render();
+  });
+  if (TG.length > 4096) {
+    $("tredToggle").disabled = true;
+    $("tredToggle").parentElement.title = "too many targets for transitive reduction";
+  }
+  $("allEdgesToggle").addEventListener("change", e => {
+    graphView.allEdges = e.target.checked;
+    graphView.render();
+  });
+  $("treemapCrumbs").addEventListener("click", e => {
+    const b = e.target.closest("button[data-i]");
+    if (b) {
+      treemapView.stack = treemapView.stack.slice(0, +b.dataset.i + 1);
+      treemapView.hover = null;
+      treemapView.render();
+    }
+  });
+} else {
+  $("tabTargets").style.display = "none";
+  $("tabTreemap").style.display = "none";
+}
 
 // ---------------------------------------------------------------- search ---
 // Matching tasks stay lit in both gantt views (everything else dims, same
@@ -2195,7 +2931,10 @@ function repaintAll() {
   actualView.render();
   simView.render();
   if (flameView) flameView.render();
+  if (graphView) graphView.render();
+  if (treemapView) treemapView.render();
   if (selectedTask != null) $("detailKindSw").style.background = kindColor(T[selectedTask].kind);
+  if (selectedTargetId != null) $("tdKindSw").style.background = targetColor(TG[selectedTargetId]);
   renderSpeedupChart();
 }
 themeBtn.addEventListener("click", () => {
@@ -2216,12 +2955,17 @@ new ResizeObserver(() => {
     lastW = w;
     actualView.resize(); simView.resize();
     if (flameView) flameView.resize();
+    if (graphView) graphView.resize();
+    if (treemapView) treemapView.resize();
     if (chart) chart.resize(); else renderSpeedupChart();
   }
 }).observe(document.querySelector(".wrap"));
 
 paintSwatches();
 renderSpeedupChart();
+
+// console/automation handle for debugging reports in devtools
+window.__ninjascope = { DATA, T, TG, go, graphView, treemapView, showTarget, locateTask };
 
 } // bootReport
 </script>
