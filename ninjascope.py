@@ -25,14 +25,18 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import math
 import os
+import random
 import re
 from array import array
 import shutil
+import statistics
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import webbrowser
 import zlib
 from concurrent.futures import ThreadPoolExecutor
@@ -44,6 +48,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 CORE_OPTIONS = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
+MIN_RATE = 0.05  # a progress rate of 0 would make the scheduler's dt infinite
 
 
 # --------------------------------------------------------------------------
@@ -68,6 +73,7 @@ class NinjaManifest:
         self.scope: dict[str, str] = {}
         self.edges: list[Edge] = []
         self.rule_bindings: dict[str, dict[str, str]] = {}  # rule name -> raw vars
+        self.pools: dict[str, dict[str, str]] = {}  # pool name -> raw vars (depth)
         self.files: list[str] = []  # parsed ninja files; Edge.src indexes here
         self._cur_file = 0
         self._norm_cache: dict[str, str] = {}
@@ -122,7 +128,10 @@ class NinjaManifest:
                 if not subpath.is_absolute():
                     subpath = self.builddir / subpath
                 self.parse(subpath)
-            elif keyword in ("pool", "default"):
+            elif keyword == "pool":
+                # the indented `depth = N` lands in this context, like rule vars
+                context = self.pools.setdefault(line.split()[1], {})
+            elif keyword == "default":
                 continue
             elif "=" in line:
                 key, _, value = line.partition("=")
@@ -215,6 +224,35 @@ class NinjaManifest:
                 resolving.discard(name)
 
         return self._expand(template, resolve)
+
+    def edge_pool(self, edge: Edge) -> str:
+        """The pool this edge runs in ('' when unpooled).
+
+        Same precedence as any other binding: edge, then rule, then file scope.
+        """
+        raw = edge.bindings.get("pool")
+        if raw is None:
+            raw = self.rule_bindings.get(edge.rule, {}).get("pool")
+        if raw is None:
+            raw = self.scope.get("pool")
+        return self._expand(raw).strip() if raw else ""
+
+    def pool_depth(self, name: str) -> int | None:
+        """Concurrency limit of a pool, or None when it doesn't constrain.
+
+        `console` is built into ninja (depth 1, plus console access) and is
+        never declared in the manifest. A declared depth of 0 means unlimited.
+        """
+        if name == "console":
+            return 1
+        raw = self.pools.get(name, {}).get("depth")
+        if raw is None:
+            return None
+        try:
+            depth = int(self._expand(raw).strip())
+        except ValueError:
+            return None
+        return depth if depth > 0 else None
 
     def _expand_path_list(self, s: str) -> list[str]:
         """Split a path list on unescaped spaces, expanding vars and escapes."""
@@ -748,35 +786,122 @@ def critical_path(graph: TaskGraph, order: list[int]):
     return cp_len, list(reversed(path)), slack
 
 
-def simulate(graph: TaskGraph, cores: float, tails: list[int]) -> int:
-    """Greedy list scheduling (critical-path-first). Returns makespan in ms."""
+def simulate(graph: TaskGraph, cores: float, work: list[int],
+             tails: list[int], rate=None,
+             pools: tuple[list[int], list[float]] | None = None
+             ) -> tuple[float, float]:
+    """Greedy list scheduling (critical-path-first) with rate-based progress.
+
+    Returns (makespan_ms, busy_core_ms).
+
+    A task's duration depends on how crowded the machine is, which depends on
+    the other tasks' durations — circular if scheduled directly. The way out is
+    that the rate depends only on *global* occupancy, so everything running
+    progresses at the same rate: run a virtual clock `v` with dv = r·dt, and a
+    task admitted at v0 with work w always finishes at v0 + w regardless of what
+    starts or stops in between. The running heap is keyed on that virtual finish
+    and never needs re-keying; dt = Δv / r converts back to wall time. Only
+    completions are events, so r is constant between them and dt lands exactly
+    on the next one — this is exact, not a discretization.
+
+    `rate` maps the number of running jobs to a progress rate in (0, 1]; with
+    the default (None) and `work` set to measured durations this reproduces
+    plain fixed-duration scheduling. Cores are one shared pool, so what slows a
+    task down is simply how many others are running beside it.
+
+    `pools` is (pool index per task, depth per pool); index 0 is the implicit
+    unlimited pool. A full pool must not block admission of tasks in other
+    pools, so ready tasks are kept in one heap per pool and admission takes the
+    highest-priority task among the pools that still have room.
+    """
     tasks = graph.tasks
+    pool_of, depths = pools or ([0] * len(tasks), [float("inf")])
+    npools = len(depths)
     pending = list(graph.list_size)
-    ready = [(-tails[t.id], t.id) for t in tasks if pending[t.dl] == 0]
-    heapify(ready)
-    running: list[tuple[int, int]] = []
-    now = 0
-    makespan = 0
-    while ready or running:
-        while ready and len(running) < cores:
-            _, i = heappop(ready)
-            finish = now + tasks[i].dur
-            heappush(running, (finish, i))
-            makespan = max(makespan, finish)
+    heaps: list[list[tuple[int, int]]] = [[] for _ in range(npools)]
+    for t in tasks:
+        if pending[t.dl] == 0:
+            heaps[pool_of[t.id]].append((-tails[t.id], t.id))
+    for h in heaps:
+        heapify(h)
+    inuse = [0] * npools
+    running: list[tuple[float, int]] = []
+    now = v = makespan = busy = 0.0
+    while any(heaps) or running:
+        while len(running) < cores:
+            best = -1
+            best_key = 0
+            for p in range(npools):
+                h = heaps[p]
+                if h and inuse[p] < depths[p] and (best < 0 or h[0][0] < best_key):
+                    best, best_key = p, h[0][0]
+            if best < 0:
+                break
+            _, i = heappop(heaps[best])
+            inuse[best] += 1
+            heappush(running, (v + work[i], i))
         if not running:
             break
-        now, i = heappop(running)
+        c = len(running)
+        r = 1.0 if rate is None else min(1.0, max(rate(c), MIN_RATE))
+        v_next = running[0][0]
+        dt = (v_next - v) / r
+        now += dt
+        v = v_next
+        busy += c * dt
+        if now > makespan:
+            makespan = now
         # release everything finishing at the same instant
-        done = [i]
-        while running and running[0][0] == now:
+        done = []
+        while running and running[0][0] == v_next:
             done.append(heappop(running)[1])
         for j in done:
+            inuse[pool_of[j]] -= 1
             for li in graph.containing[j]:
                 pending[li] -= 1
                 if pending[li] == 0:
                     for s in graph.tasks_with_dl[li]:
-                        heappush(ready, (-tails[s], s))
-    return makespan
+                        heappush(heaps[pool_of[s]], (-tails[s], s))
+    return makespan, busy
+
+
+def collect_pools(manifest: NinjaManifest, tasks: list[Task]):
+    """Group tasks by the ninja pool they run in.
+
+    Returns (pool index per task, depth per pool, info per pool) with index 0
+    the implicit unlimited pool, or None when no declared pool actually binds.
+    A pool with no more tasks than its depth can never delay anything, so it is
+    dropped rather than shown as a constraint the user could act on.
+    """
+    idx: dict[str, int] = {}
+    names: list[str] = []
+    depths: list[float] = [float("inf")]
+    members: list[list[int]] = [[]]
+    pool_of = [0] * len(tasks)
+    for t in tasks:
+        name = manifest.edge_pool(t.edge)
+        if not name:
+            continue
+        depth = manifest.pool_depth(name)
+        if depth is None:
+            continue
+        p = idx.get(name)
+        if p is None:
+            p = idx[name] = len(names) + 1
+            names.append(name)
+            depths.append(depth)
+            members.append([])
+        pool_of[t.id] = p
+        members[p].append(t.id)
+
+    keep = [p for p in range(1, len(names) + 1) if len(members[p]) > depths[p]]
+    if not keep:
+        return None
+    remap = {p: i + 1 for i, p in enumerate(keep)}
+    pool_of = [remap.get(p, 0) for p in pool_of]
+    info = [{"name": names[p - 1], "depth": depths[p], "tasks": members[p]}
+            for p in keep]
+    return pool_of, [float("inf")] + [depths[p] for p in keep], info
 
 
 def compute_tails(graph: TaskGraph, order: list[int]) -> list[int]:
@@ -1196,22 +1321,57 @@ def build_report(builddir: Path, title: str | None, no_deps: bool,
             if timed else None)
     work = sum(t.dur for t in tasks)
 
-    # observed peak concurrency
+    # observed peak concurrency, plus the plateau the build actually sat at.
+    # .ninja_log records neither -j nor the machine, and the core count of
+    # whatever generates the report is often not the one that built: a CI build
+    # inspected locally is a normal workflow. The time-weighted p95 of
+    # concurrency is the job-slot estimate — the plateau, without the odd
+    # instant where ninja momentarily overshoots setting it.
     events = sorted([(t.start, 1) for t in timed] + [(t.end, -1) for t in timed])
     peak = cur = 0
-    for _, delta in events:
+    at_conc: dict[int, int] = {}
+    prev_t = events[0][0] if events else 0
+    for t_ev, delta in events:
+        if t_ev > prev_t and cur > 0:
+            at_conc[cur] = at_conc.get(cur, 0) + (t_ev - prev_t)
+        prev_t = t_ev
         cur += delta
         peak = max(peak, cur)
+    job_slots = None
+    if at_conc:
+        busy_ms = sum(at_conc.values())
+        acc = 0
+        for c in sorted(at_conc):
+            acc += at_conc[c]
+            if acc >= 0.95 * busy_ms:
+                job_slots = c
+                break
 
-    # once a core count reaches the critical-path bound, higher counts can't
-    # improve — fill them in without simulating
+    # pools are a hard constraint ninja enforces, so the baked curve honors
+    # them; without them the simulator promises parallelism the build can't take
+    pool_data = collect_pools(manifest, tasks)
+    sched_pools = pool_data[:2] if pool_data else None
+    if pool_data:
+        print("pools          : " + ", ".join(
+            f"{p['name']} (depth {p['depth']}, {len(p['tasks'])} tasks)"
+            for p in pool_data[2]))
+
+    # once a core count reaches the floor, higher counts can't improve — fill
+    # them in without simulating. That floor is the critical path, unless a pool
+    # serializes work below it
+    work_per_task = [t.dur for t in tasks]
+    floor = cp_len
+    if sched_pools:
+        floor = round(simulate(graph, float("inf"), work_per_task, tails,
+                               pools=sched_pools)[0])
     speedup = []
     makespan = None
     for n in CORE_OPTIONS:
-        if makespan != cp_len:
-            makespan = simulate(graph, n, tails)
+        if makespan != floor:
+            makespan = round(simulate(graph, n, work_per_task, tails,
+                                      pools=sched_pools)[0])
         speedup.append({"cores": n, "makespan": makespan})
-    speedup.append({"cores": None, "makespan": cp_len})  # infinite cores
+    speedup.append({"cores": None, "makespan": floor})  # infinite cores
 
     rules = sorted({t.edge.rule for t in tasks})
     rule_idx = {r: i for i, r in enumerate(rules)}
@@ -1241,6 +1401,7 @@ def build_report(builddir: Path, title: str | None, no_deps: bool,
             "work": work,
             "cpLength": cp_len,
             "peakConcurrency": peak,
+            "jobSlots": job_slots,
             "taskCount": len(tasks),
             "mixedLog": len(runs) > 1 or recompacted,
             "recompacted": recompacted,
@@ -1273,6 +1434,10 @@ def build_report(builddir: Path, title: str | None, no_deps: bool,
         cols["cmd"] = cmds
     data["tasksCols"] = cols
     data["depLists"] = dep_lists
+    if pool_data:
+        # member lists rather than a per-task column: pools normally hold a
+        # handful of link steps, so this is bytes instead of one per task
+        data["pools"] = pool_data[2]
 
     if targets is not None:
         cols["target"] = task_target
@@ -1321,6 +1486,7 @@ def render_html(data: dict, compress: bool | None = None, level: int = 6) -> str
 # --------------------------------------------------------------------------
 
 _O_TOKEN = re.compile(r'-o\s+("[^"]+"|\S+)')
+_OUT_TOKEN = re.compile(r'([-/])OUT:("[^"]+"|\S+)', re.IGNORECASE)
 
 
 def _quoted(p) -> str:
@@ -1524,16 +1690,601 @@ def profile_build_job(bridge: "Bridge", job: dict) -> None:
 
 
 # --------------------------------------------------------------------------
+# contention calibration
+#
+# How much slower does a task run because other tasks are running? The obvious
+# answer — compare tasks that ran when the machine was busy against tasks that
+# ran when it was quiet, straight out of .ninja_log — does not survive contact
+# with real data. A build is either saturated or nearly idle, with almost
+# nothing in between, and the idle stretches are the serialized head and the
+# final link: not a fair sample of anything. So the contrast is *created*: take
+# a handful of the build's own commands, re-run them alone and again with the
+# machine held at known load, and time them.
+# --------------------------------------------------------------------------
+
+CONTENTION_FILE = ".ninjascope-contention.json"
+# Machine load to probe at, as a fraction of the job slots. The isolated run is
+# the baseline; f(1/cores) is within a percent of 1 for any realistic core count.
+# 1.5 is deliberately past the job count the build used: without a measurement
+# up there, "would fewer jobs have been faster?" has no evidence behind it, and
+# the model would have to either extrapolate or stay silent.
+CALIB_LEVELS = (0.25, 0.5, 1.0, 1.5)
+
+
+def harvest_commands(builddir: Path, manifest: NinjaManifest) -> dict[str, str]:
+    """Output key -> the exact command ninja runs, from `ninja -t commands`."""
+    proc = subprocess.run(["ninja", "-C", str(builddir), "-t", "commands"],
+                          capture_output=True, text=True,
+                          encoding="utf-8", errors="replace")
+    out: dict[str, str] = {}
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        m = _O_TOKEN.search(line)
+        if m:
+            out[manifest.norm(m.group(1).strip('"'))] = line
+    return out
+
+
+def redirect_output(cmd: str, tmp: Path) -> str | None:
+    """Rewrite the output path so a re-run leaves the build tree alone.
+
+    Handles `-o <path>` (clang, gcc) and `/OUT:<path>` (MSVC link.exe, lib.exe).
+    Returns None when neither is present, and that must stay a hard skip rather
+    than a best effort: plenty of archivers take the output positionally
+    (`llvm-ar qc libfoo.a …`) and some rules delete the real artifact first, so
+    a command we can't positively redirect is a command we must not run.
+    """
+    m = _O_TOKEN.search(cmd)
+    if m:
+        ext = Path(m.group(1).strip('"')).suffix or ".out"
+        return cmd[:m.start()] + f'-o {_quoted(tmp / ("out" + ext))}' + cmd[m.end():]
+    m = _OUT_TOKEN.search(cmd)
+    if m:
+        ext = Path(m.group(2).strip('"')).suffix or ".out"
+        return (cmd[:m.start()] + f'{m.group(1)}OUT:{_quoted(tmp / ("out" + ext))}'
+                + cmd[m.end():])
+    return None
+
+
+def total_ram() -> int | None:
+    """Physical RAM in bytes, or None where we can't tell."""
+    try:
+        if sys.platform == "win32":
+            import ctypes
+            from ctypes import wintypes
+
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [("dwLength", wintypes.DWORD),
+                            ("dwMemoryLoad", wintypes.DWORD),
+                            ("ullTotalPhys", ctypes.c_uint64),
+                            ("ullAvailPhys", ctypes.c_uint64),
+                            ("ullTotalPageFile", ctypes.c_uint64),
+                            ("ullAvailPageFile", ctypes.c_uint64),
+                            ("ullTotalVirtual", ctypes.c_uint64),
+                            ("ullAvailVirtual", ctypes.c_uint64),
+                            ("ullAvailExtendedVirtual", ctypes.c_uint64)]
+
+            st = MEMORYSTATUSEX()
+            st.dwLength = ctypes.sizeof(st)
+            if ctypes.WinDLL("kernel32").GlobalMemoryStatusEx(ctypes.byref(st)):
+                return int(st.ullTotalPhys)
+            return None
+        if sys.platform == "darwin":
+            out = subprocess.run(["sysctl", "-n", "hw.memsize"],
+                                 capture_output=True, text=True)
+            return int(out.stdout.strip())
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemTotal:"):
+                return int(line.split()[1]) * 1024
+    except Exception:
+        pass
+    return None
+
+
+def pick_probes(tasks: list[Task], cmd_by_output: dict[str, str],
+                per_kind: int = 3) -> list[dict]:
+    """Representative tasks to time: per rule kind, the median-duration step
+    plus the heaviest ones.
+
+    Steps under 300 ms are dominated by process startup, which no amount of
+    contention changes; steps over 10 s make the sweep too slow to sit through.
+    """
+    by_kind: dict[str, list[Task]] = {}
+    for t in tasks:
+        if not 300 <= t.dur <= 10_000:
+            continue
+        if not any(o in cmd_by_output for o in t.edge.outputs):
+            continue
+        by_kind.setdefault(classify_rule(t.edge.rule), []).append(t)
+
+    probes: list[dict] = []
+    for kind, group in sorted(by_kind.items()):
+        group.sort(key=lambda t: t.dur)
+        picks = {len(group) // 2}
+        for k in range(1, per_kind):
+            picks.add(max(0, len(group) - k))
+        for i in sorted(picks)[:per_kind]:
+            t = group[i]
+            cmd = next(cmd_by_output[o] for o in t.edge.outputs
+                       if o in cmd_by_output)
+            probes.append({"task": t.id, "kind": kind, "dur": t.dur,
+                           "name": t.edge.display, "cmd": cmd})
+    return probes
+
+
+def pick_memory_probes(tasks: list[Task], cmd_by_output: dict[str, str],
+                       per_kind: int = 3) -> list[dict]:
+    """Tasks to sample peak RSS from: per kind, the heaviest plus the median.
+
+    No duration floor, unlike the timing probes — a 165 ms link still shows its
+    footprint, and link steps are usually the memory hogs. A step whose output
+    can't be redirected is skipped outright rather than run against the real
+    build tree, which in practice excludes archivers that take their output
+    positionally.
+    """
+    by_kind: dict[str, list[Task]] = {}
+    for t in tasks:
+        if t.dur <= 0:
+            continue
+        cmd = next((cmd_by_output[o] for o in t.edge.outputs
+                    if o in cmd_by_output), None)
+        if cmd is None or redirect_output(cmd, Path(".")) is None:
+            continue
+        by_kind.setdefault(classify_rule(t.edge.rule), []).append(t)
+
+    probes: list[dict] = []
+    for kind, group in sorted(by_kind.items()):
+        group.sort(key=lambda t: t.dur)
+        # the largest step dominates the footprint; the median says whether the
+        # kind is uniform or the big one is an outlier
+        picks = sorted({len(group) - 1, len(group) // 2,
+                        max(0, len(group) - 2)})[-per_kind:]
+        for i in picks:
+            t = group[i]
+            cmd = next(cmd_by_output[o] for o in t.edge.outputs
+                       if o in cmd_by_output)
+            probes.append({"task": t.id, "kind": kind, "dur": t.dur,
+                           "name": t.edge.display, "cmd": cmd})
+    return probes
+
+
+def _peak_memory_reader(proc: subprocess.Popen):
+    """Attach a peak-memory meter to a just-started process tree.
+
+    Returns a zero-argument callable giving peak bytes (or None). Windows gets
+    an exact whole-tree figure from a job object; POSIX uses the rusage of
+    waited-for children, which is only meaningful when nothing else is running —
+    which is exactly when this is used (the isolated probe runs).
+    """
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class BASIC(ctypes.Structure):
+                _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64),
+                            ("PerJobUserTimeLimit", ctypes.c_int64),
+                            ("LimitFlags", wintypes.DWORD),
+                            ("MinimumWorkingSetSize", ctypes.c_size_t),
+                            ("MaximumWorkingSetSize", ctypes.c_size_t),
+                            ("ActiveProcessLimit", wintypes.DWORD),
+                            ("Affinity", ctypes.c_size_t),
+                            ("PriorityClass", wintypes.DWORD),
+                            ("SchedulingClass", wintypes.DWORD)]
+
+            class IOC(ctypes.Structure):
+                _fields_ = [(n, ctypes.c_uint64) for n in
+                            ("ReadOperationCount", "WriteOperationCount",
+                             "OtherOperationCount", "ReadTransferCount",
+                             "WriteTransferCount", "OtherTransferCount")]
+
+            class EXT(ctypes.Structure):
+                _fields_ = [("BasicLimitInformation", BASIC), ("IoInfo", IOC),
+                            ("ProcessMemoryLimit", ctypes.c_size_t),
+                            ("JobMemoryLimit", ctypes.c_size_t),
+                            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                            ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            job = k32.CreateJobObjectW(None, None)
+            if not job:
+                return lambda: None
+            # the shell is the child and the compiler its grandchild; both land
+            # in the job, and neither has allocated anything yet at this point
+            if not k32.AssignProcessToJobObject(job, int(proc._handle)):
+                k32.CloseHandle(job)
+                return lambda: None
+
+            def read():
+                info = EXT()
+                ok = k32.QueryInformationJobObject(
+                    job, 9, ctypes.byref(info), ctypes.sizeof(info), None)
+                peak = int(info.PeakJobMemoryUsed) if ok else None
+                k32.CloseHandle(job)
+                return peak or None
+            return read
+        except Exception:
+            return lambda: None
+    try:
+        import resource
+        before = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+
+        def read():
+            after = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+            if after <= before:
+                return None
+            scale = 1 if sys.platform == "darwin" else 1024  # bytes vs KB
+            return after * scale
+        return read
+    except Exception:
+        return lambda: None
+
+
+def time_command(builddir: Path, cmd: str, measure_mem: bool = False
+                 ) -> tuple[float | None, int | None]:
+    """Run one build command with its output redirected away from the tree.
+
+    Returns (wall_ms, peak_bytes); wall_ms is None if the command failed, so a
+    broken probe drops out of the fit instead of poisoning it.
+    """
+    tmp = Path(tempfile.mkdtemp(prefix="ninjascope_calib_"))
+    try:
+        modified = redirect_output(cmd, tmp)
+        if modified is None:
+            return None, None
+        t0 = time.perf_counter()
+        proc = subprocess.Popen(modified, shell=True, cwd=builddir,
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+        read_peak = _peak_memory_reader(proc) if measure_mem else None
+        try:
+            rc = proc.wait(timeout=600)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            return None, None
+        ms = (time.perf_counter() - t0) * 1000
+        peak = read_peak() if read_peak else None
+        return (ms if rc == 0 else None), peak
+    except Exception:
+        return None, None
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+class LoadGenerator:
+    """Background load built from the build's own commands.
+
+    A synthetic CPU spinner would contend on ALUs but not on the memory
+    controller, the last-level cache or the page cache — which is most of what
+    actually slows parallel compiles — so it would understate contention badly.
+    Real commands it is.
+    """
+
+    def __init__(self, builddir: Path, cmds: list[str]):
+        self.builddir = builddir
+        self.cmds = cmds
+        self._stop = threading.Event()
+        self._threads: list[threading.Thread] = []
+        self._procs: dict[int, subprocess.Popen] = {}
+        self._lock = threading.Lock()
+
+    def _worker(self, seed: int) -> None:
+        rng = random.Random(seed)
+        tmp = Path(tempfile.mkdtemp(prefix="ninjascope_load_"))
+        try:
+            while not self._stop.is_set():
+                modified = redirect_output(rng.choice(self.cmds), tmp)
+                if modified is None:
+                    continue
+                proc = subprocess.Popen(modified, shell=True, cwd=self.builddir,
+                                        stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.DEVNULL)
+                with self._lock:
+                    self._procs[seed] = proc
+                try:
+                    proc.wait()
+                except Exception:
+                    pass
+                with self._lock:
+                    self._procs.pop(seed, None)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def start(self, n: int) -> None:
+        self._stop.clear()
+        for i in range(n):
+            th = threading.Thread(target=self._worker, args=(i,), daemon=True)
+            th.start()
+            self._threads.append(th)
+        if n:
+            time.sleep(2.0)  # let the load reach steady state before timing
+
+    def stop(self) -> None:
+        self._stop.set()
+        with self._lock:
+            for proc in list(self._procs.values()):
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        for th in self._threads:
+            th.join(timeout=30)
+        self._threads.clear()
+
+
+def _huber(x: float, delta: float = 0.2) -> float:
+    a = abs(x)
+    return 0.5 * x * x if a <= delta else delta * (a - 0.5 * delta)
+
+
+def fit_inflation(samples: list[dict], cores: int) -> dict | None:
+    """Fit f(u) = 1 + beta * u**gamma to timed probe runs.
+
+    `samples` are {"probe": i, "kind": k, "c": concurrent jobs, "ms": t}; each
+    probe's isolated runs give its baseline, so the fit sees only ratios and the
+    probes' wildly different sizes cancel out.
+
+    Load is measured as *excess* concurrency, u = (c - 1) / (cores - 1): 0 for a
+    job running alone and 1 at the job count the build used. That makes the
+    isolated baseline exact by construction — f(1 job) = 1 — which the "at 1
+    core, nothing is competing" property of the simulator depends on. Using
+    c/cores instead leaves a percent or so of phantom contention down there.
+
+    Bounded by construction: the caller clamps u at the highest level actually
+    timed, so the curve is never evaluated on a load nothing was measured at —
+    which is what makes it safe behind a slider that goes to 8192 cores.
+    """
+    span = max(cores - 1, 1)
+    base: dict[int, list[float]] = {}
+    for s in samples:
+        if s["c"] <= 1:
+            base.setdefault(s["probe"], []).append(s["ms"])
+    obs = []
+    for s in samples:
+        if s["c"] <= 1 or s["probe"] not in base:
+            continue
+        b = sum(base[s["probe"]]) / len(base[s["probe"]])
+        if b > 0:
+            obs.append(((s["c"] - 1) / span, math.log(s["ms"] / b), s["kind"]))
+    if len(obs) < 8:
+        return None
+
+    def loss(beta: float, gamma: float, rows=None) -> float:
+        rows = obs if rows is None else rows
+        total = 0.0
+        for u, ly, _ in rows:
+            total += _huber(ly - math.log1p(beta * u ** gamma))
+        return total
+
+    def golden(f, lo, hi, iters=40):
+        phi = (math.sqrt(5) - 1) / 2
+        c, d = hi - phi * (hi - lo), lo + phi * (hi - lo)
+        fc, fd = f(c), f(d)
+        for _ in range(iters):
+            if fc < fd:
+                hi, d, fd = d, c, fc
+                c = hi - phi * (hi - lo)
+                fc = f(c)
+            else:
+                lo, c, fc = c, d, fd
+                d = lo + phi * (hi - lo)
+                fd = f(d)
+        return (lo + hi) / 2
+
+    def best_beta(gamma: float, rows=None) -> float:
+        return golden(lambda b: loss(b, gamma, rows), 0.0, 3.0, 32)
+
+    log_gamma = golden(lambda lg: loss(best_beta(math.exp(lg)), math.exp(lg)),
+                       math.log(0.2), math.log(4.0), 24)
+    gamma = math.exp(log_gamma)
+    beta = best_beta(gamma)
+
+    # goodness of fit on the log ratios, and the model-free per-level table that
+    # lets anyone check the curve without trusting its shape
+    mean = sum(ly for _, ly, _ in obs) / len(obs)
+    ss_tot = sum((ly - mean) ** 2 for _, ly, _ in obs)
+    ss_res = sum((ly - math.log1p(beta * u ** gamma)) ** 2 for u, ly, _ in obs)
+    levels = []
+    for u in sorted({round(u, 4) for u, _, _ in obs}):
+        rows = [ly for uu, ly, _ in obs if round(uu, 4) == u]
+        levels.append({"u": u, "jobs": round(1 + u * span), "n": len(rows),
+                       "inflation": round(math.exp(sum(rows) / len(rows)), 4),
+                       "model": round(1 + beta * u ** gamma, 4)})
+    per_kind = {}
+    for kind in sorted({k for _, _, k in obs}):
+        rows = [r for r in obs if r[2] == kind]
+        if len(rows) >= 4:
+            per_kind[kind] = round(best_beta(gamma, rows), 4)
+
+    return {"beta": round(beta, 4), "gamma": round(gamma, 4),
+            # the highest load actually measured: the curve is clamped there so
+            # it is never evaluated on loads nothing was timed at
+            "uMax": max(u for u, _, _ in obs),
+            "r2": round(1 - ss_res / ss_tot, 4) if ss_tot > 0 else None,
+            "samples": len(obs), "levels": levels, "perKind": per_kind}
+
+
+def calibrate(builddir: Path, manifest: NinjaManifest, tasks: list[Task],
+              cores: int, repeats: int = 2, per_kind: int = 3,
+              progress=None) -> dict:
+    """Time representative build steps alone and under load; fit the curve."""
+    cmd_by_output = harvest_commands(builddir, manifest)
+    if not cmd_by_output:
+        return {"error": "`ninja -t commands` produced nothing — is ninja on "
+                         "PATH and the build configured?"}
+    probes = pick_probes(tasks, cmd_by_output, per_kind)
+    if len(probes) < 2:
+        return {"error": "no suitable probe tasks (need steps between 0.3 s "
+                         "and 10 s with a rewritable -o)"}
+
+    probe_cmds = {p["cmd"] for p in probes}
+    background = [c for c in cmd_by_output.values() if c not in probe_cmds]
+    if not background:
+        background = [p["cmd"] for p in probes]
+    load = LoadGenerator(builddir, background)
+
+    # order matters more than sample size here: sweeping the load levels in
+    # ascending order would confound thermal drift with load perfectly, since
+    # the machine is hottest at the end. Randomize, and interleave an isolated
+    # pass between levels so the drift itself is measured.
+    rng = random.Random(20260725)
+    plan: list[float] = [0.0]  # discarded warm-up pass
+    for _ in range(repeats):
+        levels = list(CALIB_LEVELS)
+        rng.shuffle(levels)
+        for u in levels:
+            plan += [0.0, u]
+    plan.append(0.0)
+
+    # A separate isolated pass for peak memory, before the timed sweep: the
+    # timing probes are restricted to steps long enough for their duration to
+    # mean something, but footprint doesn't care how long a step ran, and the
+    # steps left out (short links especially) are often the biggest ones.
+    mem_probes = pick_memory_probes(tasks, cmd_by_output, per_kind)
+    samples: list[dict] = []
+    mem_raw: dict[str, list[int]] = {}
+    total = len(plan) * len(probes) + len(mem_probes)
+    done = 0
+    for p in mem_probes:
+        ms, peak = time_command(builddir, p["cmd"], measure_mem=True)
+        done += 1
+        if progress:
+            progress(done, total, 1)
+        # a failed re-run still reports whatever it allocated before dying, which
+        # would understate the real footprint — only count commands that finished
+        if ms is not None and peak:
+            mem_raw.setdefault(p["kind"], []).append(peak)
+
+    for pass_idx, u in enumerate(plan):
+        conc = 1 if u <= 0 else max(1, round(u * cores))
+        load.start(conc - 1)
+        try:
+            for i, p in enumerate(probes):
+                isolated = conc <= 1
+                ms, peak = time_command(builddir, p["cmd"], measure_mem=isolated)
+                done += 1
+                if progress:
+                    progress(done, total, conc)
+                if ms is None:
+                    continue
+                if peak:
+                    mem_raw.setdefault(p["kind"], []).append(peak)
+                if pass_idx == 0:
+                    continue  # warm-up: page cache, ASLR, first-touch
+                samples.append({"probe": i, "kind": p["kind"], "c": conc,
+                                "ms": ms, "pass": pass_idx})
+        finally:
+            load.stop()
+
+    fit = fit_inflation(samples, cores)
+    if fit is None:
+        return {"error": "not enough usable timings to fit a curve "
+                         f"({len(samples)} samples)"}
+
+    # drift control: isolated passes run throughout the session, so the trend
+    # across them separates sustained-load frequency drop from contention
+    iso = {}
+    for s in samples:
+        if s["c"] <= 1:
+            iso.setdefault(s["pass"], []).append((s["probe"], s["ms"]))
+    drift = None
+    if len(iso) >= 2:
+        keys = sorted(iso)
+        first, last = dict(iso[keys[0]]), dict(iso[keys[-1]])
+        both = [p for p in first if p in last and first[p] > 0]
+        if both:
+            drift = round(sum(last[p] / first[p] for p in both) / len(both), 4)
+
+    fit.update({
+        "source": "calibrate",
+        "cores": cores,
+        "generated": datetime.now().isoformat(timespec="seconds"),
+        "probes": [{"name": p["name"], "kind": p["kind"], "dur": p["dur"]}
+                   for p in probes],
+        # the raw timings, so the fit can be re-examined or re-fitted without
+        # sitting through another sweep. A few dozen numbers.
+        "timings": [{"probe": s["probe"], "c": s["c"], "ms": round(s["ms"], 1),
+                     "pass": s["pass"]} for s in samples],
+        # peak RSS per rule kind. `unsampled` is not noise — it says which kinds
+        # the report has no footprint for, so it can label its own coverage
+        # instead of quietly treating them as free.
+        "mem": {k: {"med": int(statistics.median(v)), "max": max(v), "n": len(v)}
+                for k, v in sorted(mem_raw.items())} or None,
+        "memUnsampled": sorted({classify_rule(t.edge.rule) for t in tasks
+                                if t.dur > 0} - set(mem_raw)) or None,
+        "drift": drift,
+        "machine": {"cpuCount": os.cpu_count(), "platform": sys.platform,
+                    "ramBytes": total_ram()},
+    })
+    return fit
+
+
+def calibrate_job(bridge: "Bridge", job: dict) -> None:
+    """Run a calibration sweep from the interactive bridge and save the result."""
+    try:
+        def progress(done, total, conc):
+            job["done"], job["total"] = done, total
+            job["note"] = "alone" if conc <= 1 else f"{conc} jobs at once"
+
+        result = calibrate(bridge.builddir, bridge.manifest, bridge.tasks,
+                           bridge.cores, progress=progress)
+        if "error" in result:
+            job.update(state="error", error=result["error"])
+            return
+        path = bridge.builddir / CONTENTION_FILE
+        path.write_text(json.dumps(result, indent=1), encoding="utf-8")
+        print(f"calibration saved to {path}")
+        job["result"] = {"beta": result["beta"], "gamma": result["gamma"],
+                         "r2": result["r2"], "cores": result["cores"],
+                         "drift": result.get("drift"),
+                         "levels": result["levels"], "path": str(path)}
+        job["state"] = "done"
+    except Exception as exc:
+        job.update(state="error", error=f"{type(exc).__name__}: {exc}")
+
+
+def load_contention(builddir: Path, override: str | None) -> dict | None:
+    """The machine's contention profile: an explicit --contention, else the
+    file `--calibrate` left in the build dir."""
+    if override:
+        parts = override.split(",")
+        try:
+            beta, gamma, cores = (float(parts[0]), float(parts[1]),
+                                  int(parts[2]))
+        except (IndexError, ValueError):
+            sys.exit("error: --contention wants beta,gamma,cores "
+                     "(e.g. 0.31,0.72,16)")
+        return {"beta": beta, "gamma": gamma, "cores": cores,
+                "source": "flag", "r2": None, "levels": [], "perKind": {}}
+    path = builddir / CONTENTION_FILE
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        print(f"warning: ignoring {path} ({exc})", file=sys.stderr)
+        return None
+    if not isinstance(data, dict) or "beta" not in data:
+        print(f"warning: ignoring {path} (not a contention profile)",
+              file=sys.stderr)
+        return None
+    return data
+
+
+# --------------------------------------------------------------------------
 # interactive mode: HTTP bridge
 # --------------------------------------------------------------------------
 
 class Bridge:
     def __init__(self, builddir: Path, html: str, tasks: list[Task],
-                 manifest: NinjaManifest):
+                 manifest: NinjaManifest, cores: int = 0):
         self.builddir = builddir
         self.html = html
         self.tasks = tasks
         self.manifest = manifest
+        self.cores = cores or os.cpu_count() or 8
         self.jobs: dict[str, dict] = {}
         self._job_seq = 0
         self.lock = threading.Lock()
@@ -1605,6 +2356,13 @@ def serve(bridge: Bridge, port: int, open_browser: bool) -> None:
                 threading.Thread(target=profile_build_job, args=(bridge, job),
                                  daemon=True).start()
                 self._json({"job": jid})
+            elif path == "/api/calibrate":
+                jid, job = bridge.new_job()
+                print(f"calibrating contention against {bridge.cores} job "
+                      "slots (a few minutes)...")
+                threading.Thread(target=calibrate_job, args=(bridge, job),
+                                 daemon=True).start()
+                self._json({"job": jid})
             else:
                 self._json({"error": "not found"}, 404)
 
@@ -1660,6 +2418,19 @@ def main() -> None:
                     help="file of finding ids to suppress, one fnmatch-style "
                          "pattern per line, '#' comments (default: "
                          "<builddir>/.ninjascope-ignore if present)")
+    ap.add_argument("--calibrate", action="store_true",
+                    help="measure this machine's contention curve: re-run a few "
+                         "of the build's own steps alone and again under "
+                         "controlled load (~3 min), save the result to "
+                         f"<builddir>/{CONTENTION_FILE}, and use it in the "
+                         "report. Later runs pick the file up automatically")
+    ap.add_argument("--cores", type=int, default=None, metavar="N",
+                    help="job slots the build ran with (default: the observed "
+                         "concurrency plateau, else this machine's core count). "
+                         ".ninja_log records neither -j nor the build machine")
+    ap.add_argument("--contention", default=None, metavar="B,G,C",
+                    help="use this contention curve instead of a calibrated "
+                         "one: beta,gamma,cores for f(u) = 1 + beta*u**gamma")
     ap.add_argument("--interactive", action="store_true",
                     help="serve the report from a live process with compiler "
                          "profiling (clang -ftime-trace) instead of writing a file")
@@ -1691,6 +2462,42 @@ def main() -> None:
     data, tasks, manifest = build_report(builddir, args.title, args.no_deps,
                                          args.no_commands, args.run)
 
+    cores = args.cores or data["meta"]["jobSlots"] or os.cpu_count() or 8
+    if args.calibrate:
+        if args.contention:
+            sys.exit("error: --calibrate measures the curve, --contention "
+                     "supplies one; pick one")
+        jobs_at = ", ".join(str(max(1, round(u * cores))) for u in CALIB_LEVELS)
+        print(f"calibrating    : timing probe steps at 1, {jobs_at} concurrent "
+              "jobs (a few minutes)...")
+
+        def show(done, total, conc):
+            print(f"\r  {done}/{total} runs  "
+                  f"({'alone' if conc <= 1 else f'{conc} jobs at once'})     ",
+                  end="", flush=True)
+
+        result = calibrate(builddir, manifest, tasks, cores, progress=show)
+        print()
+        if "error" in result:
+            sys.exit(f"error: calibration failed: {result['error']}")
+        (builddir / CONTENTION_FILE).write_text(
+            json.dumps(result, indent=1), encoding="utf-8")
+        print(f"  saved to {builddir / CONTENTION_FILE}")
+
+    contention = load_contention(builddir, args.contention)
+    if contention:
+        data["meta"]["contention"] = contention
+        at_full = 1 + contention["beta"]
+        detail = [f"×{at_full:.2f} at {contention['cores']} jobs",
+                  f"beta {contention['beta']:.3f}",
+                  f"gamma {contention['gamma']:.2f}"]
+        if contention.get("r2") is not None:
+            detail.append(f"R² {contention['r2']:.2f}")
+        if contention.get("drift"):
+            detail.append(f"drift ×{contention['drift']:.2f}")
+        print(f"contention     : {' · '.join(detail)} "
+              f"({contention.get('source', 'file')})")
+
     ignore_path = args.ignore_file or builddir / ".ninjascope-ignore"
     if args.ignore_file and not ignore_path.is_file():
         sys.exit(f"error: ignore file not found: {ignore_path}")
@@ -1704,7 +2511,8 @@ def main() -> None:
                        level=args.compress_level)
 
     if args.interactive:
-        serve(Bridge(builddir, html, tasks, manifest), args.port, not args.no_open)
+        serve(Bridge(builddir, html, tasks, manifest, cores),
+              args.port, not args.no_open)
     else:
         args.output.write_text(html, encoding="utf-8")
         print(f"report written : {args.output}")

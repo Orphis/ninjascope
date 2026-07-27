@@ -250,6 +250,10 @@
   }
   .btn:disabled { opacity: 0.55; cursor: default; }
   .btn-mini { padding: 1px 8px; margin-left: 8px; font-size: 11px; }
+  .btn.sel { background: var(--kind-compile); border-color: var(--kind-compile); color: #fff; }
+  .calib-strip { font-size: 12px; color: var(--text-muted); margin: -6px 0 12px; }
+  .calib-strip b { color: var(--text-secondary); font-weight: 600; }
+  .calib-strip.bad b { color: var(--critical); }
   .util-label b { color: var(--text-secondary); font-weight: 600; }
   .profile-error { color: var(--critical); font-size: 12.5px; white-space: pre-wrap; word-break: break-all; }
   #flameSummary { display: flex; gap: 20px; flex-wrap: wrap; margin-top: 12px; }
@@ -283,6 +287,7 @@
                autocomplete="off" spellcheck="false">
         <div class="search-results" id="searchResults" style="display:none"></div>
       </div>
+      <button class="btn" id="calibrateBtn" style="display:none" title="Times a dozen of this build's own steps alone and under load to measure how much the crowd costs (~3 min). Outputs go to a temp dir; the build tree is untouched">measure contention</button>
       <button class="btn" id="profileBuildBtn" style="display:none">profile whole build</button>
       <button id="themeToggle" title="Toggle color theme">theme: auto</button>
     </div>
@@ -304,7 +309,7 @@
 
     <section>
       <h2>Speedup curve</h2>
-      <p class="sub">Predicted wall time vs. core count. The curve can never cross the critical path — past the knee, adding cores buys nothing.</p>
+      <p class="sub" id="speedupSub">Predicted wall time vs. core count. The curve can never cross the critical path — past the knee, adding cores buys nothing.</p>
       <div class="panel"><div id="speedupChart"></div><div class="fallback-table" id="speedupFallback" style="display:none"></div></div>
     </section>
 
@@ -326,16 +331,29 @@
 
     <section>
       <h2>What-if: change the core count</h2>
-      <p class="sub">Greedy critical-path-first scheduling of the real dependency DAG using measured durations — what this build would look like with a different number of cores (e.g. remote execution).</p>
+      <p class="sub">Greedy critical-path-first scheduling of the real dependency DAG using measured durations — what this build would look like with a different number of cores (e.g. remote execution). Ninja pools, where declared, cap concurrency the same way the real build does.</p>
       <div class="simbar">
         <div class="simcores"><div class="cl">simulated cores</div><div class="cv" id="simCoresLabel"></div></div>
         <input type="range" id="coreSlider" min="0" max="0" step="1">
+        <label id="poolToggleWrap" style="display:none" title="Ninja pools cap how many tasks of a kind run at once, whatever the core count"><input type="checkbox" id="poolToggle" checked> honor pools</label>
         <div class="simstats">
           <div><b id="simWall"></b>predicted wall time</div>
           <div><b id="simSpeedup"></b>vs. actual build</div>
           <div><b id="simUtil"></b>core utilization</div>
+          <div id="simTaxWrap" style="display:none"><b id="simTax"></b>contention tax</div>
+          <div id="simMemWrap" style="display:none"><b id="simMem"></b><span id="simMemLabel">peak RAM</span></div>
         </div>
       </div>
+      <div class="simbar" id="contentionBar" style="display:none">
+        <div class="simcores"><div class="cl">contention</div><div class="cv" id="simContLabel"></div></div>
+        <div class="toolbar" id="contChips" style="margin:0">
+          <button class="btn btn-mini sel" data-lam="1" style="margin-left:0" title="Every core shares one machine's memory system, as measured on this one">as measured</button>
+          <button class="btn btn-mini" data-lam="0.5" title="Half the measured slowdown — a machine that copes better with the same job count">half</button>
+          <button class="btn btn-mini" data-lam="0" title="Nothing competes: the ideal DAG, and also the remote-execution reading where each action gets its own worker">none</button>
+          <span class="hint" id="contHint" style="margin-left:0"></span>
+        </div>
+      </div>
+      <div class="calib-strip" id="calibStrip"></div>
       <div class="panel timeline" id="simTimeline"></div>
     </section>
 
@@ -505,6 +523,9 @@ function fmtMs(ms, precise) {
   return m + " m " + String(s).padStart(2, "0") + " s";
 }
 const fmtX = x => (x >= 10 ? Math.round(x) : x.toFixed(1)) + "×";
+const fmtBytes = n =>
+  n >= 2 ** 30 ? (n / 2 ** 30).toFixed(n < 10 * 2 ** 30 ? 1 : 0) + " GB" :
+  n >= 2 ** 20 ? Math.round(n / 2 ** 20) + " MB" : Math.round(n / 2 ** 10) + " KB";
 const esc = s => s.replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
 class Heap {
@@ -602,26 +623,87 @@ const TARGET_KIND = { lib: "archive", exe: "link", gen: "codegen", group: "other
 const targetColor = t => kindColor(TARGET_KIND[t.kind] || "other");
 
 // ------------------------------------------------------------- scheduling ---
-function schedule(cores) {
-  const start = new Float64Array(N), end = new Float64Array(N);
+// downstream longest path measured in `work` — the scheduling priority. The
+// `tails` array above is this over measured durations; the simulator needs it
+// over whatever work model it is scheduling.
+function tailsOf(work) {
+  const out = new Float64Array(N);
+  for (let k = N - 1; k >= 0; k--) {
+    const i = topo[k];
+    let best = 0;
+    for (const s of succs[i]) if (out[s] > best) best = out[s];
+    out[i] = work[i] + best;
+  }
+  return out;
+}
+
+const R_MIN = 0.05;  // a rate of 0 would make dt infinite and hang the page
+
+// Greedy critical-path-first list scheduling, with progress rate depending on
+// how crowded the machine is.
+//
+// The naive formulation is circular — a task's duration depends on how many
+// others run alongside it, which depends on their durations. The way out: the
+// rate depends only on *global* occupancy, so every running task progresses at
+// the same rate at any instant. Run a virtual clock V with dV = r·dt; a task
+// admitted at V0 with work w always finishes at V0 + w, no matter what starts
+// or stops in between. So the running heap is keyed on virtual finish and never
+// needs re-keying, and dt = ΔV / r converts back to wall time.
+//
+// Only completions are events (a slot frees, and a task becomes ready, only when
+// something finishes), so r is constant between them and dt lands exactly on the
+// next completion — this is exact, not a discretization.
+//
+//   W       uncontended work per task; W = measured durations reproduces the
+//           fixed-duration schedule bit for bit with the default rate
+//   tailsW  priorities, over W
+//   rate    jobs running -> progress rate in (0, 1]. Cores are one shared pool,
+//           so what slows a task down is simply how many other tasks are running
+//   pools   {of, depths} — ninja pool index per task and each pool's depth (0 is
+//           the implicit unlimited pool). A full pool must not block admission of
+//           tasks in other pools, so ready tasks are kept in one heap per pool and
+//           admission takes the best-priority task among the pools with room
+function scheduleC(cores, W, tailsW, opts = {}) {
+  const rate = opts.rate || (() => 1);
+  const poolOf = opts.pools ? opts.pools.of : null;
+  const depths = opts.pools ? opts.pools.depths : [Infinity];
+  const np = depths.length;
+  const start = new Float64Array(N), end = new Float64Array(N), vf = new Float64Array(N);
   const indeg = T.map(t => t.deps.length);
-  const ready = new Heap((a, b) => tails[b] - tails[a] || a - b);
-  for (let i = 0; i < N; i++) if (indeg[i] === 0) ready.push(i);
-  const running = new Heap((a, b) => end[a] - end[b]);
-  let now = 0, makespan = 0;
-  while (ready.size || running.size) {
-    while (ready.size && running.size < cores) {
-      const i = ready.pop();
-      start[i] = now; end[i] = now + T[i].dur;
+  const heaps = [], inuse = new Int32Array(np);
+  for (let p = 0; p < np; p++) heaps.push(new Heap((a, b) => tailsW[b] - tailsW[a] || a - b));
+  let nready = 0;
+  const enqueue = i => { heaps[poolOf ? poolOf[i] : 0].push(i); nready++; };
+  for (let i = 0; i < N; i++) if (indeg[i] === 0) enqueue(i);
+  const running = new Heap((a, b) => vf[a] - vf[b]);
+  let now = 0, V = 0, makespan = 0, busy = 0;
+  while (nready || running.size) {
+    while (running.size < cores) {
+      let best = -1, bestKey = 0;
+      for (let p = 0; p < np; p++) {
+        const h = heaps[p];
+        if (!h.size || inuse[p] >= depths[p]) continue;
+        const k = tailsW[h.peek()];
+        if (best < 0 || k > bestKey) { best = p; bestKey = k; }
+      }
+      if (best < 0) break;
+      const i = heaps[best].pop(); nready--; inuse[best]++;
+      start[i] = now; vf[i] = V + W[i];
       running.push(i);
-      if (end[i] > makespan) makespan = end[i];
     }
     if (!running.size) break;
+    const c = running.size;
+    const r = Math.min(1, Math.max(rate(c), R_MIN));
+    const vNext = vf[running.peek()];
+    const dt = (vNext - V) / r;
+    now += dt; V = vNext; busy += c * dt;
+    if (now > makespan) makespan = now;
     const i = running.pop();
-    now = end[i];
-    for (const s of succs[i]) if (--indeg[s] === 0) ready.push(s);
+    end[i] = now;
+    inuse[poolOf ? poolOf[i] : 0]--;
+    for (const s of succs[i]) if (--indeg[s] === 0) enqueue(s);
   }
-  return { start, end, makespan };
+  return { start, end, makespan, busy };
 }
 
 // pack intervals into compact display lanes
@@ -1012,13 +1094,126 @@ if (M.recompacted) {
   $("mixedBanner").style.display = "block";
 }
 
+const actualItems = T.filter(t => t.start != null).map(t => ({ id: t.id, start: t.start, end: t.end }));
+const actualEnd = Math.max(...actualItems.map(i => i.end), 1);
+
+// ------------------------------------------------------------ contention ---
+// Tasks run slower when the machine is crowded. `ninjascope --calibrate` times
+// a few of this build's own steps alone and again under known load and fits
+// f(u) = 1 + beta·u^gamma, the duration inflation at load u. Progress rate is
+// 1/f, and integrating it over the concurrency actually observed during a task
+// gives W — how long that task would have taken with the machine to itself.
+// d − W is what the crowd cost.
+//
+// Cores are one shared pool: what slows a task down is how many other tasks are
+// running, full stop. Load is *excess* concurrency, u = (jobs − 1) / (cores − 1),
+// where `cores` is the job count the machine was calibrated at — so u is zero for
+// a job running alone and 1 at the load the build actually ran under. Zero at one
+// job is not a convention, it's the calibration baseline, and it's what makes
+// "at 1 core nothing is competing" exact rather than approximately true.
+//
+// u is clamped at the highest load actually timed, so the curve is never
+// evaluated outside its evidence. That is what keeps it sane behind a slider
+// that goes to 8192: past the measured range the model stops getting worse,
+// because nothing was ever measured getting worse.
+// how much of the build's work the run on the timeline actually did. Analysis
+// uses every task's most recent duration across all runs, so an incremental run
+// leaves most of the DAG without a concurrency curve to reason about — and
+// without a wall time worth comparing a whole-DAG replay against.
+const runCoverage = (() => {
+  const runWork = actualItems.reduce((a, it) => a + (it.end - it.start), 0);
+  return M.work > 0 ? runWork / M.work : 0;
+})();
+
+const CONT = (() => {
+  const c = M.contention;
+  if (!c || !(c.beta >= 0) || !(c.cores > 0)) return null;
+  // durations only mean anything for tasks the selected run actually built; if
+  // it covers little of the build, most of W would be guesswork
+  const coverage = runCoverage;
+  if (coverage < 0.8) return null;
+  const uMax = c.uMax > 0 ? c.uMax : 1;
+  const span = Math.max(c.cores - 1, 1);
+  const load = jobs => Math.min(Math.max((jobs - 1) / span, 0), uMax);
+  const rate = jobs => 1 / (1 + c.beta * Math.pow(load(jobs), c.gamma));
+  return { ...c, uMax, load, rate, coverage, atFull: 1 + c.beta,
+           maxJobs: Math.round(1 + uMax * span) };
+})();
+
+// ---------------------------------------------------------------- memory ---
+// Peak RSS per rule kind, from the isolated calibration probes. Summing the
+// footprints of everything running at an instant gives the machine's peak
+// demand, which is an *upper bound*: a compile's peak is a brief spike near the
+// end, and this assumes every running step hits its own peak together.
+//
+// Coverage cuts the other way and is not guessed at. A step is only sampled if
+// its output can be positively redirected to a temp dir, which rules out
+// archivers that take the output positionally (`llvm-ar qc libfoo.a …`) — those
+// kinds count as zero here, and the report says which ones they were rather
+// than inventing a number for them.
+const MEM = (() => {
+  const m = CONT && CONT.mem;
+  if (!m) return null;
+  const perKind = {};
+  for (const [k, v] of Object.entries(m))
+    perKind[k] = typeof v === "number" ? { med: v, max: v, n: 1 } : v;
+  if (!Object.keys(perKind).length) return null;
+  const of = id => (perKind[T[id].kind] || { med: 0 }).med;
+  const ram = (CONT.machine || {}).ramBytes || null;
+  return {
+    perKind, of, ram,
+    sampled: Object.keys(perKind).sort(),
+    unsampled: (CONT.memUnsampled || []).filter(k => !perKind[k]),
+    // worst case: every kind at the largest footprint measured for it
+    ofMax: id => (perKind[T[id].kind] || { max: 0 }).max,
+  };
+})();
+
+// highest simultaneous footprint over a schedule, as [{id, start, end}]
+function peakMem(items, sizeOf) {
+  if (!MEM) return 0;
+  const size = sizeOf || MEM.of;
+  const ev = [];
+  for (const it of items) {
+    const m = size(it.id);
+    if (m > 0 && it.end > it.start) ev.push([it.start, m], [it.end, -m]);
+  }
+  ev.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  let cur = 0, peak = 0;
+  for (const [, d] of ev) { cur += d; if (cur > peak) peak = cur; }
+  return peak;
+}
+const memMeasured = MEM ? peakMem(actualItems) : 0;
+
+// what the simulator schedules: work per task, and the priorities over it.
+// Without a profile that is just the measured durations; with one it is each
+// task's uncontended work, integrated over the concurrency that was actually
+// running while it ran. Tasks the selected run didn't build keep their measured
+// duration — there is no concurrency curve to integrate for them.
+const W = Float64Array.from(T, t => t.dur);
+if (CONT) {
+  const workAt = makeStepIntegral(actualItems, CONT.rate);
+  for (const t of T)
+    if (t.start != null && t.dur > 0)
+      W[t.id] = Math.min(workAt(t.start, t.end), t.dur);
+}
+const tailsW = tailsOf(W);
+const workW = W.reduce((a, w) => a + w, 0);        // uncontended total work
+const cpW = tailsW.reduce((a, x) => Math.max(a, x), 0);  // uncontended CP
+const taxWork = M.work - workW;
+const taxCp = M.cpLength - cpW;
+
 const hasWall = M.wall != null;
 const avgPar = M.work / Math.max(M.wall, 1);
 const maxSpeedup = M.work / Math.max(M.cpLength, 1);
 const tiles = [
   [fmtMs(M.wall), "wall time", nRuns > 1 ? "selected run" : "as built"],
-  [fmtMs(M.work), "total work", "sum of all task durations"],
-  [hasWall ? fmtX(avgPar) : "–", "avg parallelism", `peak ${M.peakConcurrency} tasks at once`],
+  [fmtMs(M.work), "total work", CONT
+    ? `${fmtMs(workW)} of it uncontended`
+    : "sum of all task durations"],
+  [hasWall ? fmtX(avgPar) : "–", "avg parallelism",
+   `peak ${M.peakConcurrency} tasks at once` +
+   (memMeasured ? ` · ~${fmtBytes(memMeasured)} resident` : "")],
   [fmtMs(M.cpLength), "critical path",
    hasWall ? (100 * M.cpLength / Math.max(M.wall, 1)).toFixed(0) + "% of wall time"
            : "no timeline available"],
@@ -1042,8 +1237,6 @@ function paintSwatches() {
 
 // actual timeline
 const actualView = new TimelineView($("actualTimeline"), { onSelect: it => toggleDetail(it.id) });
-const actualItems = T.filter(t => t.start != null).map(t => ({ id: t.id, start: t.start, end: t.end }));
-const actualEnd = Math.max(...actualItems.map(i => i.end), 1);
 actualView.setData(actualItems, actualEnd, M.peakConcurrency, "CPU utilization — tasks running over time");
 
 // simulation
@@ -1054,17 +1247,93 @@ const slider = $("coreSlider");
 slider.max = CORE_STEPS.length - 1;
 slider.value = Math.max(CORE_STEPS.findIndex(c => c >= (M.peakConcurrency || 8)), 0);
 
+
+// ninja pools cap concurrency per group of tasks no matter how many cores are
+// available; absent unless the manifest declares one that actually binds
+const POOLS = (() => {
+  if (!DATA.pools || !DATA.pools.length) return null;
+  const of = new Int32Array(N);
+  DATA.pools.forEach((p, k) => p.tasks.forEach(id => { of[id] = k + 1; }));
+  return { of, depths: [Infinity].concat(DATA.pools.map(p => p.depth)) };
+})();
+if (POOLS) {
+  $("poolToggleWrap").style.display = "";
+  $("poolToggleWrap").title = DATA.pools
+    .map(p => `${p.name}: depth ${p.depth}, ${p.tasks.length} tasks`).join(" · ");
+  $("poolToggle").addEventListener("change", () => {
+    runSim();
+    if (chart) renderSpeedupChart();   // the sweep honors pools too
+  });
+}
+
+// Contention target. lambda scales the measured slowdown: 1 = as measured,
+// 0 = an ideal machine, so r stays 1 at zero load for every setting. lambda > 1
+// is deliberately not offered — that is extrapolating a fit past its evidence.
+//
+// Cores are a single shared pool, which makes the ends of the chip row the two
+// readings of the slider's high end: "as measured" is that many cores all
+// sharing one machine's memory system, "none" is that many independent workers.
+// The speedup chart draws both, so the gap between them is the price of sharing.
+let lambda = 1;
+function simOpts() {
+  return {
+    pools: POOLS && $("poolToggle").checked ? POOLS : undefined,
+    rate: CONT && lambda > 0 ? c => 1 - lambda * (1 - CONT.rate(c)) : undefined,
+  };
+}
+
+if (MEM) $("simMemWrap").style.display = "";
+if (CONT) {
+  $("contentionBar").style.display = "";
+  $("simTaxWrap").style.display = "";
+  $("contHint").textContent =
+    `measured up to ${CONT.maxJobs} jobs at once; past that the model holds ` +
+    `steady at ×${(1 / CONT.rate(CONT.maxJobs)).toFixed(2)} instead of guessing`;
+  $("contChips").addEventListener("click", e => {
+    const btn = e.target.closest("button[data-lam]");
+    if (!btn) return;
+    lambda = +btn.dataset.lam;
+    $("contChips").querySelectorAll("button[data-lam]")
+      .forEach(b => b.classList.toggle("sel", b === btn));
+    runSim();
+  });
+}
+
 function runSim() {
   const cores = CORE_STEPS[+slider.value];
-  const res = schedule(cores);
+  const opts = simOpts();
+  const res = scheduleC(cores, W, tailsW, opts);
   const items = T.filter(t => t.dur > 0).map(t => ({ id: t.id, start: res.start[t.id], end: res.end[t.id] }));
   $("simCoresLabel").textContent = cores === Infinity ? "∞" : cores;
   $("simWall").textContent = fmtMs(res.makespan);
   const ratio = M.wall != null ? M.wall / Math.max(res.makespan, 1) : null;
   $("simSpeedup").textContent = ratio == null ? "–"
     : ratio >= 1 ? ratio.toFixed(2) + "× faster" : (1 / ratio).toFixed(2) + "× slower";
+  // core-seconds actually occupied, integrated by the scheduler — not the sum of
+  // measured durations, which stops being the same number under contention
   $("simUtil").textContent = cores === Infinity ? "–"
-    : (100 * M.work / (cores * Math.max(res.makespan, 1))).toFixed(0) + "%";
+    : (100 * res.busy / (cores * Math.max(res.makespan, 1))).toFixed(0) + "%";
+  if (CONT) {
+    $("simContLabel").textContent = lambda === 1 ? "as measured"
+      : lambda === 0 ? "none" : "×" + lambda;
+    $("simTax").textContent = fmtMs(Math.max(res.busy - workW, 0));
+    $("simTaxWrap").title =
+      `core-seconds this run spends on crowding rather than work; ` +
+      `${fmtMs(workW)} of real work either way`;
+  }
+  if (MEM) {
+    const peak = peakMem(items);
+    $("simMem").textContent = fmtBytes(peak);
+    $("simMemLabel").textContent = MEM.ram && peak > MEM.ram
+      ? `peak RAM — over the ${fmtBytes(MEM.ram)} on this machine`
+      : "peak RAM";
+    $("simMemWrap").title =
+      `Upper bound: every step running at that instant assumed to be at its own ` +
+      `peak (${MEM.sampled.join(", ")} measured` +
+      (MEM.unsampled.length ? `; ${MEM.unsampled.join(", ")} not sampled and ` +
+        `counted as zero` : "") + `). Worst case with each kind at its largest ` +
+      `measured footprint: ${fmtBytes(peakMem(items, MEM.ofMax))}.`;
+  }
   simView.highlightCp = $("cpToggle").checked;
   simView.setData(items, res.makespan, cores, "simulated CPU utilization");
 }
@@ -1075,6 +1344,56 @@ $("cpToggle").addEventListener("change", e => {
   actualView.render(); simView.render();
 });
 runSim();
+
+// Model check, printed where the user is about to trust a number: replay the
+// build at the configuration it actually ran with and compare to the wall time
+// it actually took.
+//
+// Be careful about what this proves. Re-crowding the tasks at the concurrency
+// they were measured at recovers their measured durations by construction — the
+// uncontended work was obtained by integrating the same rate over the same
+// curve. So at the observed job count this checks the *scheduler*, not the
+// curve, and the fixed-duration replay lands in the same place. Where the curve
+// changes the answer is away from that point, which is what the second half
+// reports. Replaying in ninja's observed order isolates the rest: ninja runs
+// ready edges roughly as they became ready, not critical-path-first.
+(() => {
+  const el = $("calibStrip");
+  const jobs = M.jobSlots || M.peakConcurrency;
+  // the simulator always schedules the whole DAG, so comparing it to the wall
+  // time of a run that only rebuilt part of it would be meaningless
+  if (!hasWall || !jobs || runCoverage < 0.8) { el.style.display = "none"; return; }
+  const pools = POOLS || undefined;
+  const dur = Float64Array.from(T, t => t.dur);
+  const fixed = scheduleC(jobs, dur, tails, { pools }).makespan;
+  const pct = ms => (ms >= M.wall ? "+" : "") +
+    (100 * (ms - M.wall) / M.wall).toFixed(0) + "%";
+  if (!CONT) {
+    el.innerHTML = `<b>model check:</b> ${fmtMs(fixed)} predicted vs ${fmtMs(M.wall)} measured ` +
+      `(${pct(fixed)}) at the ${jobs} jobs this build ran with. Durations are replayed exactly ` +
+      `as measured, so the slowdown from running ${jobs} at once is baked into every prediction ` +
+      `on this page — <code>ninjascope &lt;builddir&gt; --calibrate</code> measures it and takes it out.`;
+    return;
+  }
+  const opts = { pools, rate: CONT.rate };
+  const modeled = scheduleC(jobs, W, tailsW, opts).makespan;
+  // observed order: earlier actual start = higher priority, never-built last
+  const seen = Float64Array.from(T, t => t.start == null ? -Infinity : -t.start);
+  const inOrder = scheduleC(jobs, W, seen, opts).makespan;
+  const solo = scheduleC(1, W, tailsW, opts).makespan;
+  const soloFixed = scheduleC(1, dur, tails, { pools }).makespan;
+  const err = Math.abs(modeled - M.wall) / M.wall;
+  el.className = "calib-strip" + (err > 0.15 ? " bad" : "");
+  el.innerHTML = `<b>model check:</b> replayed at the ${jobs} jobs this build ran with, ` +
+    `the prediction is <b>${fmtMs(modeled)}</b> against ${fmtMs(M.wall)} measured ` +
+    `(${pct(modeled)}; ${fmtMs(inOrder)} in ninja's observed order, ${pct(inOrder)}). ` +
+    (err > 0.15
+      ? `That is a wide miss — treat the what-if numbers as indicative and re-run <code>--calibrate</code> on an otherwise idle machine. `
+      : "") +
+    `At that job count the curve cancels out by construction, so this checks the scheduler ` +
+    `rather than the curve; where the curve changes the answer is away from it — at 1 core it ` +
+    `predicts <b>${fmtMs(solo)}</b> instead of ${fmtMs(soloFixed)}, because nothing is competing.`;
+})();
 
 // ------------------------------------------------------------------ tabs ---
 // Hidden views have zero width, so canvases and the chart are (re)laid out on
@@ -1799,7 +2118,8 @@ const FILTER_KEY_HINTS = [
   ["type", "task kind"], ["rule", "ninja rule name"], ["dur", "duration, e.g. dur:>1s"],
   ["slack", "e.g. slack:<50ms"], ["start", "start time"], ["end", "end time"],
   ["deps", "direct dep count"], ["dependents", "dependent count"], ["is", "cp · built · notbuilt"],
-];
+].concat(CONT ? [["w", "uncontended work, e.g. w:>1s"],
+                 ["infl", "contention inflation, e.g. infl:>1.5"]] : []);
 const KIND_COUNTS = {}, RULE_COUNTS = new Map();
 T.forEach(t => {
   KIND_COUNTS[t.kind] = (KIND_COUNTS[t.kind] || 0) + 1;
@@ -1887,7 +2207,8 @@ function compileToken(tok) {
   const m = /^([a-z]+):(.+)$/.exec(tok);
   const key = m && { type: "kind", kind: "kind", rule: "rule", dur: "dur", duration: "dur",
                      slack: "slack", start: "start", end: "end", deps: "deps",
-                     dependents: "dependents", is: "is" }[m[1]];
+                     dependents: "dependents", is: "is",
+                     w: "w", work: "w", infl: "infl", inflation: "infl" }[m[1]];
   let p = null;
   if (key) {
     const val = m[2];
@@ -1903,6 +2224,12 @@ function compileToken(tok) {
     } else if (key === "deps" || key === "dependents") {
       const num = numericPredicate(val, s => /^\d+$/.test(s) ? +s : null);
       if (num) p = key === "deps" ? t => num(t.deps.length) : t => num(succs[t.id].length);
+    } else if (key === "w") {
+      const num = numericPredicate(val, parseDurationMs);
+      if (num) p = t => num(W[t.id]);
+    } else if (key === "infl") {
+      const num = numericPredicate(val, s => /^\d+(\.\d+)?$/.test(s) ? +s : null);
+      if (num) p = t => W[t.id] > 0 && num(t.dur / W[t.id]);
     } else { // dur / slack / start / end
       const num = numericPredicate(val, parseDurationMs);
       if (num) p = t => num(t[key]);
@@ -2047,6 +2374,7 @@ fetch("/api/ping").then(r => (r.ok ? r.json() : null)).then(info => {
   if (info && info.ok) {
     BRIDGE = info;
     $("profileBuildBtn").style.display = "";
+    $("calibrateBtn").style.display = "";
     $("bpPlaceholder").innerHTML =
       `No profile yet — press <b>profile whole build</b> in the header, or profile a single task from its detail panel.`;
     if (selectedTask != null) showDetail(selectedTask); // refresh actions row
@@ -2129,6 +2457,9 @@ function showDetail(id) {
     [fmtMs(heads[id]), "critical path to here"],
     [fmtMs(tails[id]), "critical path from here"],
     ...(waited != null ? [[fmtMs(waited, true), "queued (ready → start)"]] : []),
+    ...(CONT && t.start != null && W[id] > 0
+      ? [[fmtMs(W[id], true), "alone on the machine"],
+         ["×" + (t.dur / W[id]).toFixed(2), "contention inflation"]] : []),
     [esc(t.ruleName), "ninja rule"],
   ].map(([v, l]) => `<div><b>${v}</b>${l}</div>`).join("");
   renderDepList($("detailDeps"), t.deps, "nothing — ready at build start");
@@ -2335,6 +2666,58 @@ async function profileTask(id, btn) {
   btn.textContent = "Profile with -ftime-trace";
 }
 
+// --------------------------------------------- contention calibration ---
+// Everything derived from the curve (uncontended work, priorities, the whole
+// speedup sweep) is computed once at load, so a fresh measurement means a fresh
+// page rather than a live patch — say so instead of silently showing stale
+// numbers next to new ones.
+$("calibrateBtn").addEventListener("click", async () => {
+  const btn = $("calibrateBtn");
+  const strip = $("calibStrip");
+  btn.disabled = true;
+  btn.textContent = "measuring…";
+  go("timeline");            // the strip lives here; don't report into a hidden tab
+  strip.style.display = "";
+  const say = html => { strip.innerHTML = html; };
+  say(`<b>measuring contention…</b> re-running probe steps alone and under load. ` +
+      `This loads the machine on purpose — don't trust other timings until it finishes.`);
+  try {
+    const { job } = await fetch("/api/calibrate", { method: "POST" }).then(r => r.json());
+    const poll = setInterval(async () => {
+      const st = await fetch("/api/job/" + job).then(r => r.json()).catch(() => null);
+      if (!st) return;
+      if (st.state === "running") {
+        btn.textContent = st.total ? `measuring ${st.done}/${st.total}…` : "measuring…";
+        say(`<b>measuring contention…</b> run ${st.done}${st.total ? " of " + st.total : ""}` +
+            `${st.note ? ` (${esc(st.note)})` : ""}. This loads the machine on purpose — ` +
+            `don't trust other timings until it finishes.`);
+        return;
+      }
+      clearInterval(poll);
+      btn.disabled = false;
+      btn.textContent = "measure contention";
+      if (st.state === "error") {
+        strip.className = "calib-strip bad";
+        say(`<b>calibration failed:</b> ${esc(st.error)}`);
+        return;
+      }
+      const r = st.result;
+      const lv = r.levels.map(l => `${l.jobs} jobs → ×${l.inflation.toFixed(2)}`).join(", ");
+      strip.className = "calib-strip";
+      say(`<b>measured:</b> ${lv} (fitted ×${(1 + r.beta).toFixed(2)} at ${r.cores} jobs` +
+          `${r.r2 != null ? `, R² ${r.r2.toFixed(2)}` : ""}` +
+          `${r.drift ? `, drift ×${r.drift.toFixed(2)}` : ""}). Saved to ` +
+          `<code>${esc(r.path)}</code> — <a href="" onclick="location.reload();return false">reload</a> ` +
+          `to apply it to this report.`);
+    }, 1000);
+  } catch (err) {
+    btn.disabled = false;
+    btn.textContent = "measure contention";
+    strip.className = "calib-strip bad";
+    say(`<b>calibration failed:</b> ${esc(String(err))}`);
+  }
+});
+
 // ------------------------------------------------ whole-build profile ---
 $("profileBuildBtn").addEventListener("click", async () => {
   const btn = $("profileBuildBtn");
@@ -2395,33 +2778,114 @@ function renderBuildProfile(r) {
 }
 
 // ---------------------------------------------------------- speedup curve ---
+// Recomputed in-page rather than read from the baked meta.speedup: it has to
+// agree with the slider (which sweeps a finer set of core counts), and with the
+// pool and contention settings the user picked. The baked series stays as the
+// first-paint fallback for the offline table.
+// The chart, the knee and the memory finding all want the same sweep, and it is
+// the most expensive thing on the page (a full schedule per core step, plus a
+// memory profile on top). Compute it once per distinct setting.
+const SPEEDUP = (() => {
+  const dur = Float64Array.from(T, t => t.dur);
+  const real = T.filter(t => t.dur > 0);
+  const work = CONT ? W : dur, prio = CONT ? tailsW : tails;
+  const cache = new Map();
+  const compute = contended => CORE_STEPS.filter(c => isFinite(c)).map(c => {
+    const opts = simOpts();
+    if (!(contended && CONT)) opts.rate = undefined;
+    const r = scheduleC(c, work, prio, opts);
+    const out = { cores: c, makespan: r.makespan };
+    // peak simultaneous footprint of that schedule — "how many jobs before this
+    // box starts swapping", answered on the same sweep. Only the modeled curve
+    // is ever plotted, so don't pay for it twice.
+    if (MEM && contended) out.mem = peakMem(real.map(t =>
+      ({ id: t.id, start: r.start[t.id], end: r.end[t.id] })));
+    return out;
+  });
+  return (contended) => {
+    const key = `${!!contended}|${POOLS && $("poolToggle").checked}`;
+    if (!cache.has(key)) cache.set(key, compute(contended));
+    return cache.get(key);
+  };
+})();
+
 let chart = null;
 function renderSpeedupChart() {
   const el = $("speedupChart");
   if (typeof echarts === "undefined") {
-    // offline fallback: plain table
+    // offline fallback: plain table, from the same in-page sweep the slider
+    // uses so the two can't disagree
     el.style.display = "none";
     const fb = $("speedupFallback");
     fb.style.display = "block";
+    const rows = SPEEDUP(true);
     fb.innerHTML = "<table><tr><th>cores</th><th>predicted wall</th><th>speedup vs 1 core</th></tr>" +
-      M.speedup.map(p => `<tr><td>${p.cores ?? "∞"}</td><td>${fmtMs(p.makespan)}</td>` +
-        `<td>${fmtX(M.speedup[0].makespan / Math.max(p.makespan, 1))}</td></tr>`).join("") + "</table>";
+      rows.map(p => `<tr><td>${p.cores}</td><td>${fmtMs(p.makespan)}</td>` +
+        `<td>${fmtX(rows[0].makespan / Math.max(p.makespan, 1))}</td></tr>`).join("") + "</table>";
     return;
   }
   if (chart) chart.dispose();
   chart = echarts.init(el, null, { renderer: "canvas" });
-  const finite = M.speedup.filter(p => p.cores != null);
+  const finite = SPEEDUP(true);
+  const ideal = CONT ? SPEEDUP(false) : null;
   const ink = cssVar("--text-secondary"), muted = cssVar("--text-muted"), grid = cssVar("--grid");
   // The perfect-scaling line dives far below the critical-path floor at high
   // core counts; unbounded, it drags the log axis down and squishes the
   // useful band. Pin the range to [just below CP, just above total work] and
   // end the ideal line where it hits the floor.
-  const yMin = M.cpLength / 1.35, yMax = M.work * 1.2;
+  const yMin = Math.min(M.cpLength, CONT ? cpW : Infinity) / 1.35, yMax = M.work * 1.2;
+  const workLine = CONT ? workW : M.work;
+  const crit = cssVar("--critical");
+
+  // The floor line is the longest path through the work the simulator is
+  // actually scheduling — cpW. Without a contention profile that is the familiar
+  // critical path; with one it is the same path measured in uncontended work,
+  // and it is the only quantity on this chart that genuinely bounds every curve.
+  //
+  // The *measured* critical path (M.cpLength, what the tile reports) is not a
+  // floor once contention is modeled: those durations were sampled at the
+  // build's own concurrency, so they carry its crowding. Drawing that as "the
+  // floor" produced a line the predicted curve never reached — it settles above
+  // it, because at high core counts the DAG's wide phase crowds one shared
+  // machine harder than the real build at -j ever did.
+  const floor = cpW;
+  // The measured path is worth its own line as the descriptive counterpart —
+  // it is what the tile reports — but only when it differs from the floor.
+  // Without a profile the two are the same number and would overplot exactly.
+  const showMeasuredCp = CONT && Math.abs(M.cpLength - floor) > 0.01 * floor;
+  //
+  // The RAM ceiling is only worth drawing when it is on screen: with 64 GB and
+  // an 11 GB peak the line sits far above the plot, invisible.
+  const showRamLine = MEM && MEM.ram &&
+    Math.max(...finite.map(p => p.mem || 0)) >= 0.25 * MEM.ram;
+
+  $("speedupSub").innerHTML =
+    `Predicted wall time vs. core count, log–log. ` +
+    (CONT
+      ? `The dashed line is the critical path measured in uncontended work ` +
+        `(${fmtMs(floor)}) — the graph's true floor, and only the ideal machine ` +
+        `reaches it; with contention modeled the prediction settles above, ` +
+        `because at high core counts the whole DAG crowds one machine harder ` +
+        `than this build at its ${CONT.cores} jobs ever did.` +
+        (showMeasuredCp
+          ? ` The dotted line is the same path measured with this build's own ` +
+            `durations (${fmtMs(M.cpLength)}), which already carry the crowding ` +
+            `it ran under — that is the figure in the tile above.`
+          : "")
+      : `The dashed line is the critical path (${fmtMs(floor)}) — the dependency ` +
+        `graph's own floor, past which adding cores buys nothing.`) +
+    (MEM ? ` Peak RAM is on the right axis` +
+           (MEM.ram && !showRamLine
+             ? `, and stays well under the ${fmtBytes(MEM.ram)} on this machine`
+             : "") + `.` : "");
+
   chart.setOption({
     animation: false,
     backgroundColor: "transparent",
-    grid: { left: 70, right: 30, top: 44, bottom: 48 },
-    legend: { top: 4, textStyle: { color: ink, fontSize: 12 }, itemWidth: 18 },
+    grid: { left: 70, right: MEM ? 74 : 30, top: 40, bottom: 48 },
+    // scroll rather than overlap if the window is narrow enough to run out of room
+    legend: { top: 4, type: "scroll", textStyle: { color: ink, fontSize: 12 },
+              itemWidth: 18, itemGap: 16 },
     tooltip: {
       trigger: "axis",
       backgroundColor: cssVar("--surface-1"), borderColor: "rgba(128,128,128,0.3)",
@@ -2434,37 +2898,72 @@ function renderSpeedupChart() {
       axisLabel: { color: muted, formatter: v => v >= 1024 ? (v / 1024) + "k" : String(v) },
       axisLine: { lineStyle: { color: grid } }, splitLine: { show: false },
     },
-    yAxis: {
+    yAxis: [{
       type: "log", name: "predicted wall time", nameTextStyle: { color: muted, align: "left" },
       min: yMin, max: yMax,
       // the exact bounds are arbitrary (cp/1.35, work*1.2) — don't label them
       axisLabel: { color: muted, formatter: v => fmtMs(v), showMinLabel: false, showMaxLabel: false },
       splitLine: { lineStyle: { color: grid } },
-    },
+    }, ...(MEM ? [{
+      type: "value", position: "right", min: 0,
+      name: "peak RAM", nameTextStyle: { color: muted, align: "right" },
+      axisLabel: { color: muted, formatter: v => fmtBytes(v) },
+      splitLine: { show: false }, axisLine: { lineStyle: { color: grid } },
+    }] : [])],
     series: [
       {
-        name: "predicted", type: "line", symbol: "circle", symbolSize: 7,
+        name: "predicted",
+        type: "line", symbol: "circle", symbolSize: 7,
         data: finite.map(p => [p.cores, p.makespan]),
         lineStyle: { width: 2, color: kindColor("compile") },
         itemStyle: { color: kindColor("compile") },
       },
+      ...(ideal ? [{
+        name: "without contention", type: "line", symbol: "none",
+        data: ideal.map(p => [p.cores, p.makespan]),
+        lineStyle: { width: 1.5, color: kindColor("codegen") },
+        itemStyle: { color: kindColor("codegen") },
+      }] : []),
       {
-        name: "perfect scaling (work ÷ cores)", type: "line", symbol: "none",
-        data: finite.map(p => [p.cores, M.work / p.cores >= yMin ? M.work / p.cores : null]),
+        name: "perfect scaling", type: "line", symbol: "none",
+        data: finite.map(p => [p.cores, workLine / p.cores >= yMin ? workLine / p.cores : null]),
         lineStyle: { width: 1.5, type: "dashed", color: muted },
         itemStyle: { color: muted },
       },
       {
-        name: "critical path (floor)", type: "line", symbol: "none",
-        data: finite.map(p => [p.cores, M.cpLength]),
-        lineStyle: { width: 1.5, type: "dashed", color: cssVar("--critical") },
-        itemStyle: { color: cssVar("--critical") },
+        name: CONT ? "critical path (uncontended)" : "critical path",
+        type: "line", symbol: "none",
+        data: finite.map(p => [p.cores, floor]),
+        lineStyle: { width: 1.5, type: "dashed", color: crit },
+        itemStyle: { color: crit },
       },
+      ...(showMeasuredCp ? [{
+        name: "critical path (measured)", type: "line", symbol: "none",
+        data: finite.map(p => [p.cores, M.cpLength]),
+        lineStyle: { width: 1.5, type: "dotted", color: crit },
+        itemStyle: { color: crit },
+      }] : []),
       {
         name: "actual build", type: "scatter", symbolSize: 11,
         data: M.wall != null ? [[Math.max(M.peakConcurrency, 1), M.wall]] : [],
         itemStyle: { color: cssVar("--text-primary") },
       },
+      ...(MEM ? [{
+        name: "peak RAM", type: "line", symbol: "none", yAxisIndex: 1,
+        tooltip: { valueFormatter: v => fmtBytes(v) },
+        data: finite.map(p => [p.cores, p.mem]),
+        lineStyle: { width: 1.5, color: kindColor("archive") },
+        itemStyle: { color: kindColor("archive") },
+        ...(showRamLine ? {
+          markLine: {
+            silent: true, symbol: "none",
+            label: { formatter: `RAM on this machine (${fmtBytes(MEM.ram)})`,
+                     color: muted, fontSize: 11, position: "insideEndTop" },
+            lineStyle: { color: kindColor("archive"), type: "dotted", width: 1.5 },
+            data: [{ yAxis: MEM.ram }],
+          },
+        } : {}),
+      }] : []),
     ],
   });
 }
@@ -2545,22 +3044,31 @@ $("leversTable").addEventListener("click", e => {
   if (row) locateTask(+row.dataset.id);
 });
 
-// average concurrency over a time range, from the measured schedule
-function makeConcIntegral(items) {
+// integral of f(concurrency) over a time range, from the measured schedule.
+// f = identity gives concurrency-seconds; f = the contention rate gives the
+// uncontended work a task got done while it was running.
+function makeStepIntegral(items, f) {
   const steps = concurrencySteps(items);
   const times = steps.map(s => s[0]);
+  const vals = steps.map(s => f(s[1]));
   const cum = [0];
   for (let j = 1; j < steps.length; j++)
-    cum[j] = cum[j - 1] + steps[j - 1][1] * (times[j] - times[j - 1]);
+    cum[j] = cum[j - 1] + vals[j - 1] * (times[j] - times[j - 1]);
   const at = t => {
     let lo = 0, hi = times.length - 1, idx = 0;
     while (lo <= hi) {
       const mid = (lo + hi) >> 1;
       if (times[mid] <= t) { idx = mid; lo = mid + 1; } else hi = mid - 1;
     }
-    return cum[idx] + steps[idx][1] * (t - times[idx]);
+    return cum[idx] + vals[idx] * (t - times[idx]);
   };
-  return (s, e) => e <= s ? 0 : (at(e) - at(s)) / (e - s);
+  return (s, e) => e <= s ? 0 : at(e) - at(s);
+}
+
+// average concurrency over a time range, from the measured schedule
+function makeConcIntegral(items) {
+  const I = makeStepIntegral(items, c => c);
+  return (s, e) => e <= s ? 0 : I(s, e) / (e - s);
 }
 
 // finding ids are stable across builds (built from task names); patterns from
@@ -2706,6 +3214,91 @@ for (const t of T) {
   }
 }
 
+// Contention tax: work that only exists because the machine was crowded.
+// Needs a calibrated profile — it cannot be read off .ninja_log (see the CONT
+// block above for why), so no profile means no finding rather than a guess.
+if (CONT && taxWork > 0.05 * M.work) {
+  pushFinding({
+    sev: taxWork > 0.15 * M.work ? "high" : "med",
+    fid: "contention-tax",
+    type: "contentiontax", x: {},
+    title: `Contention cost ${fmtMs(taxWork)} of ${fmtMs(M.work)} of CPU work (${(100 * taxWork / M.work).toFixed(0)}%)`,
+    evidence: `tasks ran up to ×${CONT.atFull.toFixed(2)} slower at ${CONT.cores} concurrent jobs` +
+      (taxCp > 0 ? ` · ${fmtMs(taxCp)} of it on the critical path` : ""),
+  });
+}
+
+// Over-subscription: past some point another concurrent job slows every other
+// one by more than it contributes. With one shared pool of cores, raising -j
+// raises the crowding by itself, so sweeping the core count is the whole test.
+// This can only fire when calibration measured *above* the job count the build
+// used (uMax > 1) — otherwise there is no evidence up there, the curve is
+// clamped flat, and throughput can only ever go up.
+let oversub = null;
+if (CONT && hasWall && CONT.uMax > 1) {
+  const pools = POOLS || undefined;
+  const jobsAt = j => scheduleC(j, W, tailsW,
+    { pools, rate: CONT.rate }).makespan;
+  const jobs = M.jobSlots || M.peakConcurrency;
+  const here = { j: jobs, ms: jobsAt(jobs) };
+  const best = CORE_STEPS
+    .filter(c => isFinite(c) && c <= CONT.maxJobs && c < here.j)
+    .map(j => ({ j, ms: jobsAt(j) }))
+    .reduce((a, b) => (b.ms < a.ms ? b : a), here);
+  if (best.j < here.j && best.ms < 0.97 * here.ms) {
+    oversub = { here, best };
+    pushFinding({
+      sev: best.ms < 0.9 * here.ms ? "med" : "low",
+      fid: "oversubscribed",
+      type: "oversub", x: oversub,
+      title: `Over-subscription: <code>-j ${here.j}</code> cost ${fmtMs(here.ms - best.ms)} — <code>-j ${best.j}</code> would have finished sooner`,
+      evidence: `${fmtMs(best.ms)} predicted at ${best.j} jobs vs ${fmtMs(here.ms)} at ${here.j}` +
+        (CONT.mem && CONT.mem.compile
+          ? ` · each compile peaks at ~${(CONT.mem.compile / 2 ** 30).toFixed(1)} GB` : ""),
+    });
+  }
+}
+
+// Memory pressure. Only fires when the machine is actually near its limit —
+// on a box with headroom the peak-RAM readout says everything there is to say,
+// and a finding would be noise.
+if (MEM && MEM.ram && memMeasured > 0) {
+  const jobs = M.jobSlots || M.peakConcurrency;
+  const sweep = SPEEDUP(true);
+  const fitting = sweep.filter(p => p.mem <= MEM.ram);
+  const largestFit = fitting.length ? fitting[fitting.length - 1].cores : null;
+  const crosses = sweep.find(p => p.mem > MEM.ram);
+  const tight = memMeasured > 0.8 * MEM.ram;
+  if (tight || (crosses && crosses.cores <= 4 * jobs)) pushFinding({
+    sev: memMeasured > MEM.ram ? "high" : tight ? "med" : "low",
+    fid: "memory-pressure",
+    type: "mempressure", x: { jobs, largestFit, crossAt: crosses && crosses.cores },
+    title: tight
+      ? `Peak memory ~${fmtBytes(memMeasured)} against ${fmtBytes(MEM.ram)} on this machine`
+      : `More than <code>-j ${largestFit}</code> would not fit in ${fmtBytes(MEM.ram)} of RAM`,
+    evidence: `${MEM.sampled.join(" + ")} steps measured` +
+      (MEM.unsampled.length ? ` (${MEM.unsampled.join(", ")} not sampled)` : "") +
+      (largestFit ? ` · largest job count that fits: ${largestFit}` : ""),
+  });
+}
+
+// Critical-path tasks that suffer most from the crowd: their measured duration
+// overstates how long the step actually needs, which caps what optimizing it
+// can win — de-crowding its neighbours may be the better lever.
+if (CONT) {
+  const hurt = T.filter(t => t.cp && t.start != null && W[t.id] > 0 &&
+                             t.dur / W[t.id] > 1.4 && t.dur >= 0.02 * wallMs)
+    .sort((a, b) => (b.dur - W[b.id]) - (a.dur - W[a.id])).slice(0, 3);
+  for (const t of hurt) pushFinding({
+    sev: "low",
+    fid: `contention-cp:${t.name}`,
+    type: "contentioncp", x: { tid: t.id },
+    title: `Critical-path task <code>${esc(shortName(t.name))}</code> ran ×${(t.dur / W[t.id]).toFixed(2)} slower than it would alone`,
+    evidence: `${fmtMs(t.dur, true)} measured vs ${fmtMs(W[t.id], true)} uncontended`,
+    id: t.id,
+  });
+}
+
 // ---- per-finding explanations: templated from the computed values ----
 function transitiveDependents(id) {
   const seen = new Set([id]), stack = [id];
@@ -2713,8 +3306,14 @@ function transitiveDependents(id) {
     for (const s of succs[stack.pop()]) if (!seen.has(s)) { seen.add(s); stack.push(s); }
   return seen.size - 1;
 }
-function kneePoint() { // smallest core count within 5% of the dependency floor
-  for (const p of M.speedup) if (p.cores != null && p.makespan <= 1.05 * M.cpLength) return p;
+// smallest core count within 5% of the best the curve ever reaches. Not the
+// critical path: a pool can hold the floor above it, and with contention
+// modeled the curve can turn back up, so the achievable minimum is the honest
+// reference point.
+function kneePoint() {
+  const curve = SPEEDUP(true);
+  const floor = curve.reduce((a, p) => Math.min(a, p.makespan), Infinity);
+  for (const p of curve) if (p.makespan <= 1.05 * floor) return p;
   return null;
 }
 const xsec = (h, body) => `<p><b>${h}.</b> ${body}</p>`;
@@ -2753,8 +3352,48 @@ function explainHtml(f, idx) {
       xsec("How it was measured", `For each critical-path task: <code>start − max(end of its deps)</code>, summed. Worst single wait: <code>${esc(shortName(worst.name))}</code>, ${fmtMs(f.x.worstQ, true)}.`),
       xsec("What to do", `This is the one finding where hardware is the answer` +
         (knee ? `: the what-if simulator predicts ${fmtMs(knee.makespan)} at ${knee.cores} cores (${(M.wall / knee.makespan).toFixed(1)}× faster)` : "") +
-        `. Alternatively, reducing total work (fewer or cheaper compiles) shrinks the queue contention.`),
+        `. Alternatively, reducing total work (fewer or cheaper compiles) shrinks the queue contention.` +
+        // don't let this and `oversubscribed` read as contradictory advice
+        (oversub ? ` But not by raising <code>-j</code> on this box: past ${oversub.best.j} concurrent jobs the added slots make the build slower, not faster (see <code>oversubscribed</code>). It has to be hardware that isn't sharing this one's memory system.` : "")),
       xsec("What won't help", `Restructuring dependencies — the graph already permits more parallelism than the cores can absorb.`));
+  } else if (f.type === "oversub") {
+    const { here, best } = f.x;
+    const mem = CONT.mem && CONT.mem.compile;
+    parts.push(
+      xsec("What this means", `Past about ${best.j} concurrent jobs, each extra job slows every other running job by more than it contributes. The machine has ${here.j} slots but roughly ${best.j} jobs' worth of memory bandwidth and cache.`),
+      xsec("How it was measured", `<code>--calibrate</code> timed this build's own commands at up to ${CONT.maxJobs} concurrent jobs — above the ${CONT.cores} this build used, which is what makes the comparison evidence rather than extrapolation. The fitted curve was then replayed through the real DAG at each <code>-j</code>${POOLS ? ", pools honored" : ""}: ${fmtMs(best.ms)} at ${best.j} against ${fmtMs(here.ms)} at ${here.j}.`),
+      xsec("What to do", `Try <code>-j ${best.j}</code>.` +
+        (mem ? ` Memory is a likely culprit: each compile peaked at ~${(mem / 2 ** 30).toFixed(1)} GB during calibration, so ${here.j} at once wants about ${(here.j * mem / 2 ** 30).toFixed(0)} GB resident.` : "") +
+        ` If only some rules are the hogs (LTO links, large TUs), a ninja <code>pool</code> on just those keeps <code>-j</code> high for everything else.`),
+      xsec("What won't help", `More slots on the same box past ${best.j} — the bottleneck is shared memory bandwidth and cache, not scheduler slots. Restructuring dependencies won't help either; the graph already offers more parallelism than the machine can absorb.`));
+  } else if (f.type === "mempressure") {
+    const kinds = Object.entries(MEM.perKind)
+      .map(([k, v]) => `${k} ~${fmtBytes(v.med)} (largest seen ${fmtBytes(v.max)}, ${v.n} sampled)`)
+      .join("; ");
+    parts.push(
+      xsec("What this means", `Running ${f.x.jobs} jobs at once wants about ${fmtBytes(memMeasured)} resident against ${fmtBytes(MEM.ram)} of physical RAM. Past that the OS starts paging, and paged-out compiles are far slower than merely contended ones — which is a different problem from the contention curve, and a much sharper cliff.`),
+      xsec("How it was measured", `<code>--calibrate</code> recorded peak RSS for each sampled step run on its own: ${kinds}.` +
+        (MEM.unsampled.length ? ` Steps of kind ${MEM.unsampled.join(", ")} could not be sampled — their output path can't be redirected to a temp dir, so re-running them would touch the real build tree — and they are counted as zero here.` : "") +
+        ` Those footprints are then summed over everything running at each instant of the schedule. This is an <b>upper bound</b>: a compile's peak is a brief spike near the end, and this assumes every running step hits its own peak at the same moment.`),
+      xsec("What to do", f.x.largestFit
+        ? `<code>-j ${f.x.largestFit}</code> is the largest job count whose predicted peak still fits. If only a few steps are the hogs — link steps usually are — a ninja <code>pool</code> on those keeps <code>-j</code> high for everything else without risking the cliff.`
+        : `Lower <code>-j</code>, or pool the heaviest steps.`),
+      xsec("What won't help", `More cores on the same box: the constraint is bytes, not slots, and adding parallelism moves this the wrong way.`));
+  } else if (f.type === "contentiontax") {
+    const lv = (CONT.levels || []).map(l =>
+      `${l.jobs || Math.round(1 + l.u * (CONT.cores - 1))} jobs → ×${l.inflation.toFixed(2)}`).join(", ");
+    parts.push(
+      xsec("What this means", `${fmtMs(taxWork)} of this build's ${fmtMs(M.work)} of CPU work exists only because tasks were competing — for memory bandwidth, last-level cache, disk, and CPU turbo headroom. On an idle machine the same work would be ${fmtMs(workW)}. The dependency floor moves too: ${fmtMs(M.cpLength)} measured, ${fmtMs(cpW)} uncontended.`),
+      xsec("How it was measured", `Not from this log — a build is either saturated or nearly idle, and its idle stretches are the serialized head and the final link, so the durations in <code>.ninja_log</code> carry no usable contrast. Instead <code>ninjascope --calibrate</code> re-ran ${(CONT.probes || []).length} of this build's own commands alone and again with the machine held at known load${lv ? ` (${lv})` : ""}, and fitted <code>f(u) = 1 + ${CONT.beta.toFixed(2)}·u<sup>${CONT.gamma.toFixed(2)}</sup></code>${CONT.r2 != null ? ` (R² ${CONT.r2.toFixed(2)})` : ""}. Each task's uncontended work is that rate integrated over the concurrency actually running while it ran.` +
+        (CONT.drift && CONT.drift > 1.02 ? ` Note: isolated runs interleaved through the session got ×${CONT.drift.toFixed(2)} slower from first to last, so part of this is sustained-load frequency drop rather than resource contention.` : "")),
+      xsec("What to do", `Fewer concurrent jobs is the counter-intuitive lever — see whether the what-if simulator finds a <code>-j</code> below ${CONT.cores} that finishes sooner. More memory bandwidth (faster RAM, fewer channels shared) helps, and so does spreading the same work across hardware that doesn't share this machine's memory system — the <b>none</b> chip on the contention control prices that out. Reducing total work helps too.`),
+      xsec("What won't help", `Restructuring dependencies — the graph is not what's slowing these tasks down.`));
+  } else if (f.type === "contentioncp") {
+    const t = T[f.x.tid];
+    parts.push(
+      xsec("What this means", `This step is on the critical path and measured ${fmtMs(t.dur, true)}, but only ${fmtMs(W[f.x.tid], true)} of that is work — the rest is the crowd. Optimizing the step itself can win at most ${fmtMs(W[f.x.tid])}; the other ${fmtMs(t.dur - W[f.x.tid])} goes away only if fewer things run beside it.`),
+      xsec("How it was measured", `The calibrated rate curve integrated over the concurrency observed during this task's runtime. Threshold: critical-path tasks over ×1.4 inflation and ≥2% of wall.`),
+      xsec("What to do", `Check the top-levers table first — if this task's payoff is large, the contention is worth attacking directly: run it when the machine is quieter (earlier in the schedule), or lower <code>-j</code> so its neighbours don't crowd it.`));
   } else if (f.type === "slowtu") {
     const t = T[f.x.tid];
     parts.push(
