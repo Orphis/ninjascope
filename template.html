@@ -402,6 +402,12 @@
       <div class="panel cp-table"><table id="findingsTable"></table></div>
     </section>
 
+    <section id="headersSection" style="display:none">
+      <h2>Hot headers</h2>
+      <p class="sub" id="headersSub"></p>
+      <div class="panel cp-table"><table id="headersTable"></table></div>
+    </section>
+
     <section>
       <h2>Near-critical paths</h2>
       <p class="sub" id="ncpSub"></p>
@@ -618,6 +624,23 @@ const TG = (() => {
   DATA.tasksCols.target.forEach((g, i) => { if (g >= 0) targets[g].tasks.push(i); });
   return targets;
 })();
+// ----------------------------------------------------------- hot headers ---
+// Discovered deps inverted: which tasks read each header, and what re-running
+// them would cost. The generator ships a ranked slice rather than the whole
+// inversion — that is millions of pairs on a real project — restricted to
+// headers under the project root, since toolchain headers are included by
+// everything and editable by nobody.
+const HDR = (() => {
+  const h = DATA.headers;
+  if (!h || !h.cols || !h.cols.name.length) return null;
+  const c = h.cols;
+  const rows = c.name.map((name, i) => ({
+    name, users: c.users[i], rebuilt: c.rebuilt[i], work: c.work[i],
+    wall: c.wall[i], gen: !!c.gen[i], tasks: h.lists[c.tl[i]],
+  }));
+  return { ...h, rows };
+})();
+
 // target kinds borrow the task-kind palette: lib=archive, exe=link, group=other
 const TARGET_KIND = { lib: "archive", exe: "link", gen: "codegen", group: "other" };
 const targetColor = t => kindColor(TARGET_KIND[t.kind] || "other");
@@ -2119,7 +2142,8 @@ const FILTER_KEY_HINTS = [
   ["slack", "e.g. slack:<50ms"], ["start", "start time"], ["end", "end time"],
   ["deps", "direct dep count"], ["dependents", "dependent count"], ["is", "cp · built · notbuilt"],
 ].concat(CONT ? [["w", "uncontended work, e.g. w:>1s"],
-                 ["infl", "contention inflation, e.g. infl:>1.5"]] : []);
+                 ["infl", "contention inflation, e.g. infl:>1.5"]] : [])
+ .concat(HDR ? [["header", "tasks that include a header"]] : []);
 const KIND_COUNTS = {}, RULE_COUNTS = new Map();
 T.forEach(t => {
   KIND_COUNTS[t.kind] = (KIND_COUNTS[t.kind] || 0) + 1;
@@ -2157,9 +2181,14 @@ function computeSuggestions(raw, caret) {
     const pool =
       (key === "type" || key === "kind") ? kindsPresent.map(k => [k, KIND_COUNTS[k] + " tasks"]) :
       key === "is" ? Object.entries(IS_COUNTS).map(([k, n]) => [k, n + " tasks"]) :
-      key === "rule" ? RULE_NAMES.map(r => [r, RULE_COUNTS.get(r) + " tasks"]) : null;
+      key === "rule" ? RULE_NAMES.map(r => [r, RULE_COUNTS.get(r) + " tasks"]) :
+      (key === "header" || key === "hdr") && HDR
+        ? HDR.rows.map(r => [r.name.toLowerCase(), r.users + " tasks include it"]) : null;
+    // header values are paths, and people type the basename, so those match on
+    // substring; the enumerable keys stay prefix-matched
+    const sub = key === "header" || key === "hdr";
     if (pool) for (const [v, hint] of pool) {
-      if (v.startsWith(prefix) && v !== prefix)
+      if ((sub ? v.includes(prefix) : v.startsWith(prefix)) && v !== prefix)
         out.push({ label: v, hint, ins: v + " ", rs: valStart, re: caret });
       if (out.length >= 6) break;
     }
@@ -2208,7 +2237,8 @@ function compileToken(tok) {
   const key = m && { type: "kind", kind: "kind", rule: "rule", dur: "dur", duration: "dur",
                      slack: "slack", start: "start", end: "end", deps: "deps",
                      dependents: "dependents", is: "is",
-                     w: "w", work: "w", infl: "infl", inflation: "infl" }[m[1]];
+                     w: "w", work: "w", infl: "infl", inflation: "infl",
+                     header: "header", hdr: "header" }[m[1]];
   let p = null;
   if (key) {
     const val = m[2];
@@ -2230,6 +2260,17 @@ function compileToken(tok) {
     } else if (key === "infl") {
       const num = numericPredicate(val, s => /^\d+(\.\d+)?$/.test(s) ? +s : null);
       if (num) p = t => W[t.id] > 0 && num(t.dur / W[t.id]);
+    } else if (key === "header" && HDR) {
+      // substring over indexed header paths, union of their consumers; an
+      // unmatched value falls through to plain name matching like any other key
+      const ids = new Set();
+      let matched = false;
+      for (const r of HDR.rows)
+        if (r.name.toLowerCase().includes(val)) {
+          matched = true;
+          for (const id of r.tasks) ids.add(id);
+        }
+      if (matched) p = t => ids.has(t.id);
     } else { // dur / slack / start / end
       const num = numericPredicate(val, parseDurationMs);
       if (num) p = t => num(t[key]);
@@ -3513,6 +3554,47 @@ const ncPaths = [{ len: M.cpLength, path: DATA.criticalPath, via: null }];
     p.forEach(x => used.add(x));
   }
 }
+// ----------------------------------------------------------- hot headers ---
+if (HDR) {
+  $("headersSection").style.display = "";
+  $("headersSub").innerHTML =
+    `What touching a header would cost: every task that reads it, plus everything ` +
+    `downstream that would relink. <b>Work</b> is the CPU time of that rebuild; ` +
+    `<b>wall</b> is the same set scheduled at ${HDR.cores} jobs, using measured ` +
+    `durations — so it answers "how long until I can run the tests again". ` +
+    `Only headers under <code>${esc(HDR.root)}</code> are indexed: toolchain ` +
+    `headers are included by everything and editable by nobody` +
+    (HDR.indexed < HDR.total
+      ? `, and the ${HDR.indexed} costliest of ${HDR.total} are shown` : "") +
+    `. Click a row to light its consumers up in the timeline.`;
+  const wallMax = Math.max(...HDR.rows.map(r => r.wall), 1);
+  $("headersTable").innerHTML =
+    "<thead><tr><th>header</th><th class='num'>included by</th>" +
+    "<th class='num'>rebuilds</th><th class='num'>work</th>" +
+    "<th class='pct-cell'>wall</th></tr></thead><tbody>" +
+    HDR.rows.map((r, k) =>
+      `<tr data-h="${k}"><td><span class="trunc" title="${esc(r.name)}">${esc(r.name)}</span>` +
+      (r.gen ? ` <span class="hint" style="margin:0">generated</span>` : "") + `</td>` +
+      `<td class='num'>${r.users}</td><td class='num'>${r.rebuilt}</td>` +
+      `<td class='num'>${fmtMs(r.work)}</td>` +
+      `<td class='pct-cell'><span class="pctbar" data-kind="compile" style="width:${
+        Math.max(2, Math.round(60 * r.wall / wallMax))}px"></span>${fmtMs(r.wall)}` +
+      (hasWall ? ` <span class="hint" style="margin:0">${
+        (100 * r.wall / Math.max(M.wall, 1)).toFixed(0)}% of a full build</span>` : "") +
+      `</td></tr>`).join("") + "</tbody>";
+  paintSwatches();
+  $("headersTable").addEventListener("click", e => {
+    const row = e.target.closest("tr[data-h]");
+    if (!row) return;
+    const r = HDR.rows[+row.dataset.h];
+    // route through the search box rather than highlighting directly: the user
+    // sees the query that produced the highlight and can widen or edit it
+    searchBox.value = "header:" + r.name.toLowerCase();
+    applySearch(searchBox.value);
+    go("timeline");
+  });
+}
+
 const cpWidth = ncPaths.length > 1 ? M.cpLength - ncPaths[1].len : null;
 $("ncpSub").innerHTML = cpWidth != null
   ? `<b>CP width ${fmtMs(cpWidth, true)}</b> — improving path #1 by more than this moves the bottleneck to path #2. Click a row to light the path up in the timeline.`

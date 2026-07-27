@@ -467,7 +467,9 @@ def ninja_deps_version(builddir: Path) -> int | None:
     return int.from_bytes(header[12:16], "little")
 
 
-def parse_ninja_deps(builddir: Path, manifest: NinjaManifest) -> dict[str, list[str]] | None:
+def parse_ninja_deps(builddir: Path, manifest: NinjaManifest,
+                     display: dict[str, str] | None = None
+                     ) -> dict[str, list[str]] | None:
     """Parse .ninja_deps (format v3/v4) directly, without running ninja.
 
     The file is a sequence of 4-byte-size-prefixed records: path records
@@ -475,6 +477,10 @@ def parse_ninja_deps(builddir: Path, manifest: NinjaManifest) -> dict[str, list[
     deps records (high bit set in the size) hold [output_id, mtime, dep_ids...]
     with the last record per output winning. Returns None on anything
     unexpected so the caller can fall back to `ninja -t deps`.
+
+    Keys are normalized (casefolded) for graph identity. Pass `display` to also
+    collect the path as written — the header index shows these to humans, and on
+    a case-sensitive filesystem the casefolded form is simply the wrong name.
     """
     version = ninja_deps_version(builddir)
     if version not in (3, 4) or array("I").itemsize != 4:
@@ -505,7 +511,11 @@ def parse_ninja_deps(builddir: Path, manifest: NinjaManifest) -> dict[str, list[
                 if checksum != ~len(paths) & 0xFFFFFFFF:
                     return None  # corrupt / not the layout we expect
                 raw = data[pos:pos + size - 4].rstrip(b"\x00")
-                paths.append(norm(raw.decode("utf-8", errors="replace")))
+                text = raw.decode("utf-8", errors="replace")
+                key = norm(text)
+                if display is not None:
+                    display.setdefault(key, text)
+                paths.append(key)
             pos += size
         return {paths[out]: [paths[d] for d in dep_ids]
                 for out, dep_ids in dep_ids_by_out.items()}
@@ -527,8 +537,13 @@ def run_deps_tool(builddir: Path) -> str | None:
     return proc.stdout
 
 
-def parse_deps_output(stdout: str | None, manifest: NinjaManifest) -> dict[str, list[str]]:
-    """Parse `ninja -t deps` output into {target_output_key: [dep_keys...]}."""
+def parse_deps_output(stdout: str | None, manifest: NinjaManifest,
+                      display: dict[str, str] | None = None) -> dict[str, list[str]]:
+    """Parse `ninja -t deps` output into {target_output_key: [dep_keys...]}.
+
+    `display` collects paths as written, for the same reason as in
+    `parse_ninja_deps`.
+    """
     if stdout is None:
         return {}
     deps: dict[str, list[str]] = {}
@@ -536,7 +551,11 @@ def parse_deps_output(stdout: str | None, manifest: NinjaManifest) -> dict[str, 
     for line in stdout.splitlines():
         if line.startswith((" ", "\t")):
             if current is not None:
-                current.append(manifest.norm(line.strip()))
+                text = line.strip()
+                key = manifest.norm(text)
+                if display is not None:
+                    display.setdefault(key, text)
+                current.append(key)
         elif ": #deps" in line:
             target = line.rsplit(": #deps", 1)[0]
             current = deps.setdefault(manifest.norm(target), [])
@@ -865,6 +884,156 @@ def simulate(graph: TaskGraph, cores: float, work: list[int],
     return makespan, busy
 
 
+HEADER_CAP = 200        # headers kept in the payload, ranked by rebuild cost
+HEADER_MIN_USERS = 2    # a header only one task includes has no blast radius
+
+
+def project_root(builddir: Path, manifest: NinjaManifest) -> str | None:
+    """Deepest directory containing the build dir and every true source file.
+
+    Used to tell the project's own headers from the toolchain's. Without it the
+    hot-header table is nothing but `sal.h`, `vcruntime.h` and `yvals_core.h` —
+    included by everything, editable by nobody. A path that no edge produces and
+    that some edge consumes is a true source, so the sources' common ancestor is
+    the repo (or a parent of it), and system headers sit outside it.
+    """
+    produced = {o for e in manifest.edges for o in e.outputs}
+    sources = {p for e in manifest.edges if e.rule != "phony"
+               for p in e.inputs if p not in produced}
+    if not sources:
+        return None
+    try:
+        root = os.path.commonpath([builddir.as_posix().casefold(), *sources])
+    except ValueError:
+        return None  # different drives: no common ancestor to speak of
+    return root.replace("\\", "/").rstrip("/")
+
+
+def dependents_closure(graph: TaskGraph, seeds) -> set[int]:
+    """Every task that would rebuild if `seeds` changed, seeds included."""
+    seen = set(seeds)
+    stack = list(seen)
+    expanded: set[int] = set()
+    while stack:
+        j = stack.pop()
+        for li in graph.containing[j]:
+            # a dep list releases the same tasks however it was reached, so
+            # expanding it once covers every task that waits on it
+            if li in expanded:
+                continue
+            expanded.add(li)
+            for s in graph.tasks_with_dl[li]:
+                if s not in seen:
+                    seen.add(s)
+                    stack.append(s)
+    return seen
+
+
+def build_header_index(manifest: NinjaManifest, tasks: list[Task],
+                       graph: TaskGraph, order: list[int],
+                       discovered: dict[str, list[str]],
+                       display: dict[str, str], builddir: Path,
+                       cores: float, pools=None) -> dict | None:
+    """Rank the project's headers by what touching one would cost.
+
+    `discovered` says which headers each output read; inverting it says which
+    outputs would rebuild if a header changed — plus everything downstream of
+    them, which is where most of the cost is (recompile 200 TUs and you relink
+    every archive behind them).
+
+    Many headers are read by exactly the same set of tasks, so consumer sets are
+    interned and the expensive part — the transitive rebuild set, its work, and
+    its wall time as a partial build — is computed once per distinct set.
+    """
+    if not discovered:
+        return None
+    root = project_root(builddir, manifest)
+    if root is None:
+        return None
+
+    task_of_output: dict[str, int] = {}
+    for t in tasks:
+        for o in t.edge.outputs:
+            task_of_output.setdefault(o, t.id)
+    produced = set(task_of_output)
+
+    prefix = root + "/"
+    users: dict[str, set[int]] = {}
+    for out, deps in discovered.items():
+        tid = task_of_output.get(out)
+        if tid is None:
+            continue
+        for h in deps:
+            if h.startswith(prefix):
+                users.setdefault(h, set()).add(tid)
+    candidates = {h: s for h, s in users.items() if len(s) >= HEADER_MIN_USERS}
+    if not candidates:
+        return None
+
+    # intern consumer sets: headers included together (a library's own headers,
+    # anything pulled in by a common umbrella) share one rebuild computation
+    sets: dict[frozenset[int], list[str]] = {}
+    for h, s in candidates.items():
+        sets.setdefault(frozenset(s), []).append(h)
+
+    durs = [t.dur for t in tasks]
+    stats: dict[frozenset[int], tuple[int, int, int]] = {}
+    for key in sets:
+        rebuilt = dependents_closure(graph, key)
+        work = sum(durs[i] for i in rebuilt)
+        stats[key] = (len(rebuilt), work, 0)
+
+    # wall time is a scheduling question, so only price the rows that survive
+    # the cap — it costs a full simulate each
+    ranked = sorted(sets, key=lambda k: (-stats[k][1], -len(sets[k])))
+    priced: set[frozenset[int]] = set()
+    for key in ranked:
+        if len(priced) >= HEADER_CAP:
+            break
+        priced.add(key)
+        rebuilt = dependents_closure(graph, key)
+        masked = [durs[i] if i in rebuilt else 0 for i in range(len(tasks))]
+        wall = simulate(graph, cores, masked,
+                        compute_tails(graph, order, masked), pools=pools)[0]
+        n, work, _ = stats[key]
+        stats[key] = (n, work, round(wall))
+
+    rows = []
+    for key in priced:
+        n, work, wall = stats[key]
+        for h in sets[key]:
+            rows.append((h, n, work, wall))
+    rows.sort(key=lambda r: (-r[3], -r[2], r[0]))
+    rows = rows[:HEADER_CAP]
+
+    # consumer lists are shared between headers, so intern them the way task
+    # dep lists are: a per-header copy is most of the bytes otherwise
+    lists: list[list[int]] = []
+    list_idx: dict[frozenset[int], int] = {}
+    cols = {k: [] for k in ("name", "users", "rebuilt", "work", "wall", "gen", "tl")}
+    for h, n, work, wall in rows:
+        key = frozenset(candidates[h])
+        li = list_idx.get(key)
+        if li is None:
+            li = list_idx[key] = len(lists)
+            lists.append(sorted(key))
+        name = display.get(h, h)
+        name = name.replace("\\", "/")
+        low = name.casefold()
+        if low.startswith(prefix):
+            name = name[len(prefix):]
+        cols["name"].append(name)
+        cols["users"].append(len(candidates[h]))
+        cols["rebuilt"].append(n)
+        cols["work"].append(work)
+        cols["wall"].append(wall)
+        cols["gen"].append(1 if h in produced else 0)
+        cols["tl"].append(li)
+    return {"cols": cols, "lists": lists, "root": root,
+            "indexed": len(rows), "total": len(candidates),
+            "cores": cores}
+
+
 def collect_pools(manifest: NinjaManifest, tasks: list[Task]):
     """Group tasks by the ninja pool they run in.
 
@@ -904,7 +1073,13 @@ def collect_pools(manifest: NinjaManifest, tasks: list[Task]):
     return pool_of, [float("inf")] + [depths[p] for p in keep], info
 
 
-def compute_tails(graph: TaskGraph, order: list[int]) -> list[int]:
+def compute_tails(graph: TaskGraph, order: list[int],
+                  work: list[int] | None = None) -> list[int]:
+    """Downstream longest path per task — the scheduling priority.
+
+    `work` overrides the measured durations, which is how the header index
+    prices a partial rebuild: zero out everything ninja wouldn't re-run.
+    """
     tasks = graph.tasks
     tails = [0] * len(tasks)
     tail_max = [0] * len(graph.dep_lists)  # max tail over tasks with dl == L
@@ -914,7 +1089,7 @@ def compute_tails(graph: TaskGraph, order: list[int]) -> list[int]:
         for li in graph.containing[i]:
             if tail_max[li] > longest:
                 longest = tail_max[li]
-        tails[i] = t.dur + longest
+        tails[i] = (t.dur if work is None else work[i]) + longest
         if tails[i] > tail_max[t.dl]:
             tail_max[t.dl] = tails[i]
     return tails
@@ -1297,12 +1472,15 @@ def build_report(builddir: Path, title: str | None, no_deps: bool,
               "recent duration across all builds.")
 
     discovered = {}
+    dep_display: dict[str, str] = {}  # normalized key -> path as written
     if use_binary_deps:
-        discovered = parse_ninja_deps(builddir, manifest)
+        discovered = parse_ninja_deps(builddir, manifest, dep_display)
         if discovered is None:  # corrupt mid-file: fall back to the tool
-            discovered = parse_deps_output(run_deps_tool(builddir), manifest)
+            discovered = parse_deps_output(run_deps_tool(builddir), manifest,
+                                           dep_display)
     elif deps_future is not None:
-        discovered = parse_deps_output(deps_future.result(), manifest)
+        discovered = parse_deps_output(deps_future.result(), manifest,
+                                       dep_display)
         deps_executor.shutdown()
 
     tasks, dep_lists, n_unlogged = build_tasks(manifest, timing, latest, discovered)
@@ -1432,6 +1610,19 @@ def build_report(builddir: Path, title: str | None, no_deps: bool,
             cmds.append(manifest.command(t.edge))
     if cmds is not None:
         cols["cmd"] = cmds
+    header_index = None
+    try:
+        header_index = build_header_index(
+            manifest, tasks, graph, order, discovered, dep_display, builddir,
+            job_slots or peak or (os.cpu_count() or 8), sched_pools)
+    except Exception as exc:  # never let an extra view break the report
+        print(f"warning: header index failed ({exc}); hot headers disabled",
+              file=sys.stderr)
+    if header_index:
+        data["headers"] = header_index
+        print(f"hot headers    : {header_index['indexed']} indexed of "
+              f"{header_index['total']} under {header_index['root']}")
+
     data["tasksCols"] = cols
     data["depLists"] = dep_lists
     if pool_data:

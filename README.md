@@ -188,6 +188,14 @@ fully static — the profiling UI simply never appears.
   build ran under.
 - **Critical path** — length, task list with per-task share; click a row to
   zoom to that task in the timeline.
+- **Hot headers** — the discovered dependencies inverted: what touching a
+  header would cost. Each row is a header with the tasks that read it, the
+  transitive rebuild set (recompile 200 TUs and every archive behind them
+  relinks), that set's CPU work, and its wall time scheduled at the job count
+  the build ran with. Click a row to light its consumers up in the timeline, or
+  type `header:foo.h` in the search bar. Only headers under the project root
+  are indexed — toolchain headers are included by everything and editable by
+  nobody — and the costliest are kept, so the table stays small on large builds.
 - **Targets** — a layered dependency graph of the *targets* (libraries,
   executables) inferred from the Ninja graph: CMake object directories and
   rule names, GN's per-target `.ninja` files, archive/link steps as anchors
